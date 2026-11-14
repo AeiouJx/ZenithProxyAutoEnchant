@@ -1,0 +1,340 @@
+{
+  "dataVersion": "1.21.11",
+  "sourceUrl": "https://zh.minecraft.wiki/w/Tutorial:%E6%9C%80%E4%BD%B3%E9%99%84%E9%AD%94%E6%8C%87%E5%8D%97?variant=zh-cn",
+  "sourceRevisionId": 1489816,
+  "lastUpdated": "2026-09-25",
+  "fetchedAt": "2026-09-28",
+  "edition": "java",
+  "notes": [
+    "本文件仅收录 Java 版方案，已移除所有基岩版变体。",
+    "expression 保留 wiki 原始合并树表达式。",
+    "totalLevels 与 minXp 直接来自 wiki 原文。",
+    "剪刀、锹的精准采集/时运方案 wiki 明确不推荐，未收录。"
+  ],
+  "plans": {
+    "helmet": {
+      "display": "头盔",
+      "variants": {
+        "all": {
+          "display": "全选（含荆棘）",
+          "totalLevels": 45,
+          "minXp": 753,
+          "expression": "{[(helmet + thorns_3)@12 + (respiration_3 + unbreaking_3)@3]@11 + [(protection_4 + mending)@2 + aqua_affinity]@3}@14"
+        },
+        "no_thorns": {
+          "display": "无荆棘",
+          "totalLevels": 27,
+          "minXp": 351,
+          "expression": "{[(helmet + respiration_3)@6 + (protection_4 + mending)@2]@8 + (unbreaking_3 + aqua_affinity)@2}@9"
+        }
+      },
+      "targetPlaceholder": "helmet"
+    },
+    "chestplate": {
+      "display": "胸甲",
+      "variants": {
+        "all": {
+          "display": "全选（含荆棘）",
+          "totalLevels": 28,
+          "minXp": 414,
+          "expression": "{[(chestplate + thorns_3)@12 + (unbreaking_3 + mending)@2]@7 + protection_4}@7"
+        },
+        "no_thorns": {
+          "display": "无荆棘",
+          "totalLevels": 13,
+          "minXp": 147,
+          "expression": "[(chestplate + protection_4)@4 + (unbreaking_3 + mending)@2]@7"
+        }
+      },
+      "targetPlaceholder": "chestplate"
+    },
+    "leggings": {
+      "display": "护腿",
+      "variants": {
+        "all": {
+          "display": "全选（含荆棘和迅捷潜行）",
+          "totalLevels": 44,
+          "minXp": 798,
+          "expression": "{[(leggings + swift_sneak_3)@12 + (thorns_3 + mending)@2]@16 + (protection_4 + unbreaking_3)@3}@11"
+        },
+        "no_thorns": {
+          "display": "无荆棘",
+          "totalLevels": 28,
+          "minXp": 414,
+          "expression": "{[(leggings + swift_sneak_3)@12 + (unbreaking_3 + mending)@2]@7 + protection_4}@7"
+        },
+        "no_thorns_no_sneak": {
+          "display": "无荆棘无迅捷潜行",
+          "totalLevels": 13,
+          "minXp": 147,
+          "expression": "[(leggings + protection_4)@4 + (unbreaking_3 + mending)@2]@7"
+        }
+      },
+      "targetPlaceholder": "leggings"
+    },
+    "boots": {
+      "display": "靴子",
+      "variants": {
+        "all": {
+          "display": "全选（含灵魂疾行和荆棘）",
+          "totalLevels": 66,
+          "minXp": 1246,
+          "expression": "{[[(boots + soul_speed_3)@12 + (thorns_3 + mending)@2]@16 + (depth_strider_3 + feather_falling_4)@4]@14 + (protection_4 + unbreaking_3)@3}@15"
+        },
+        "all_frost_walker": {
+          "display": "全选（冰霜行者）",
+          "totalLevels": 64,
+          "minXp": 1182,
+          "expression": "{[[(boots + soul_speed_3)@12 + (thorns_3 + mending)@2]@16 + (frost_walker_2 + feather_falling_4)@4]@12 + (protection_4 + unbreaking_3)@3}@15"
+        },
+        "no_thorns_no_soul": {
+          "display": "无荆棘无灵魂疾行",
+          "totalLevels": 30,
+          "minXp": 410,
+          "expression": "{[(boots + depth_strider_3)@6 + (protection_4 + unbreaking_3)@3]@9 + (feather_falling_4 + mending)@2}@10"
+        },
+        "no_thorns_no_soul_frost": {
+          "display": "无荆棘无灵魂疾行（冰霜行者）",
+          "totalLevels": 28,
+          "minXp": 378,
+          "expression": "{[(boots + frost_walker_2)@4 + (protection_4 + unbreaking_3)@3]@9 + (feather_falling_4 + mending)@2}@10"
+        }
+      },
+      "targetPlaceholder": "boots"
+    },
+    "sword": {
+      "display": "剑",
+      "variants": {
+        "all": {
+          "display": "全选",
+          "totalLevels": 49,
+          "minXp": 785,
+          "expression": "{[[(sword + looting_3)@6 + (sweeping_3 + unbreaking_3)@3]@11 + (sharpness_5 + knockback_2)@2]@11 + (fire_aspect_2 + mending)@2}@14"
+        },
+        "no_fire_knockback": {
+          "display": "无火焰附加和击退",
+          "totalLevels": 33,
+          "minXp": 489,
+          "expression": "{[(sword + looting_3)@6 + (sweeping_3 + unbreaking_3)@3]@11 + (sharpness_5 + mending)@2}@11"
+        }
+      },
+      "targetPlaceholder": "sword"
+    },
+    "axe": {
+      "display": "斧",
+      "variants": {
+        "no_silk_no_fortune": {
+          "display": "无精准采集和时运",
+          "totalLevels": 22,
+          "minXp": 274,
+          "expression": "{[(axe + sharpness_5)@5 + (unbreaking_3 + mending)@2]@7 + efficiency_5}@8"
+        }
+      },
+      "targetPlaceholder": "axe"
+    },
+    "bow": {
+      "display": "弓",
+      "variants": {
+        "infinity": {
+          "display": "无限方案",
+          "totalLevels": 29,
+          "minXp": 393,
+          "expression": "{[(bow + power_5)@5 + (infinity + unbreaking_3)@3]@9 + (punch_2 + flame)@2}@10"
+        },
+        "mending": {
+          "display": "经验修补方案",
+          "totalLevels": 26,
+          "minXp": 334,
+          "expression": "{[(bow + power_5)@5 + (punch_2 + mending)@2]@8 + (unbreaking_3 + flame)@2}@9"
+        }
+      },
+      "targetPlaceholder": "bow"
+    },
+    "crossbow": {
+      "display": "弩",
+      "variants": {
+        "multishot": {
+          "display": "多重射击方案",
+          "totalLevels": 17,
+          "minXp": 189,
+          "expression": "{[(crossbow + quick_charge_3)@3 + (unbreaking_3 + mending)@2]@7 + multishot}@5"
+        },
+        "piercing": {
+          "display": "穿透方案",
+          "totalLevels": 19,
+          "minXp": 219,
+          "expression": "{[(crossbow + piercing_4)@4 + (unbreaking_3 + mending)@2]@7 + quick_charge_3}@6"
+        }
+      },
+      "targetPlaceholder": "crossbow"
+    },
+    "trident": {
+      "display": "三叉戟",
+      "variants": {
+        "loyalty": {
+          "display": "忠诚方案",
+          "totalLevels": 33,
+          "minXp": 473,
+          "expression": "{[(trident + impaling_5)@10 + (channeling + loyalty_3)@3]@9 + (unbreaking_3 + mending)@2}@9"
+        },
+        "riptide": {
+          "display": "激流方案",
+          "totalLevels": 28,
+          "minXp": 408,
+          "expression": "{[(trident + impaling_5)@10 + (riptide_3 + mending)@2]@10 + unbreaking_3}@6"
+        }
+      },
+      "targetPlaceholder": "trident"
+    },
+    "mace": {
+      "display": "重锤",
+      "variants": {
+        "all": {
+          "display": "全选（含风爆）",
+          "totalLevels": 53,
+          "minXp": 797,
+          "expression": "{[[(mace + density_5)@5 + (unbreaking_3 + mending)@2]@7 + fire_aspect_2]@7 + [(wind_burst_1 + wind_burst_1)@4 + (wind_burst_1 + wind_burst_1)@4]@8}@16"
+        },
+        "density_no_wind": {
+          "display": "致密且无风爆",
+          "totalLevels": 21,
+          "minXp": 255,
+          "expression": "{[(mace + density_5)@5 + (fire_aspect_2 + mending)@2]@8 + unbreaking_3}@6"
+        }
+      },
+      "targetPlaceholder": "mace"
+    },
+    "spear": {
+      "display": "矛",
+      "variants": {
+        "all": {
+          "display": "全选",
+          "totalLevels": 46,
+          "minXp": 785,
+          "expression": "{[[(spear + looting_3)@6 + (lunge_3 + unbreaking_3)@3]@8 + (sharpness_5 + knockback_2)@2]@11 + (fire_aspect_2 + mending)@2}@14"
+        },
+        "no_lunge": {
+          "display": "无突进",
+          "totalLevels": 39,
+          "minXp": 559,
+          "expression": "{[[(spear + looting_3)@6 + (sharpness_5 + knockback_2)@2]@9 + (fire_aspect_2 + mending)@2]@10 + unbreaking_3}@10"
+        }
+      },
+      "targetPlaceholder": "spear"
+    },
+    "pickaxe": {
+      "display": "镐",
+      "variants": {
+        "silk_touch": {
+          "display": "精准采集方案",
+          "totalLevels": 21,
+          "minXp": 253,
+          "expression": "{[(pickaxe + efficiency_5)@5 + (unbreaking_3 + mending)@2]@7 + silk_touch}@7"
+        },
+        "fortune": {
+          "display": "时运方案",
+          "totalLevels": 23,
+          "minXp": 291,
+          "expression": "{[(pickaxe + fortune_3)@6 + (unbreaking_3 + mending)@2]@7 + efficiency_5}@8"
+        }
+      },
+      "targetPlaceholder": "pickaxe"
+    },
+    "shovel": {
+      "display": "锹",
+      "variants": {
+        "recommended": {
+          "display": "推荐方案（精准采集/时运均不推荐）",
+          "totalLevels": 14,
+          "minXp": 162,
+          "expression": "[(shovel + efficiency_5)@5 + (unbreaking_3 + mending)@2]@7"
+        }
+      },
+      "targetPlaceholder": "shovel"
+    },
+    "hoe": {
+      "display": "锄",
+      "variants": {
+        "fortune": {
+          "display": "时运方案",
+          "totalLevels": 23,
+          "minXp": 291,
+          "expression": "{[(hoe + fortune_3)@6 + (unbreaking_3 + mending)@2]@7 + efficiency_5}@8"
+        }
+      },
+      "targetPlaceholder": "hoe"
+    },
+    "fishing_rod": {
+      "display": "钓鱼竿",
+      "variants": {
+        "all": {
+          "display": "全选",
+          "totalLevels": 24,
+          "minXp": 320,
+          "expression": "{[(fishing_rod + luck_of_the_sea_3)@6 + (lure_3 + mending)@2]@10 + unbreaking_3}@6"
+        }
+      },
+      "targetPlaceholder": "fishing_rod"
+    },
+    "misc_durability_mending": {
+      "display": "打火石/盾牌/胡萝卜钓竿/诡异菌钓竿/刷子/鞘翅",
+      "variants": {
+        "durability_mending": {
+          "display": "耐久III + 经验修补",
+          "totalLevels": 6,
+          "minXp": 54,
+          "expression": "[(misc_item + unbreaking_3)@3 + mending]@3",
+          "note": "wiki 说明打火石、盾牌、刷子合成成本低，一般不附魔。"
+        }
+      },
+      "targetPlaceholder": "misc_item"
+    },
+    "shears": {
+      "display": "剪刀",
+      "variants": {
+        "not_recommended": {
+          "display": "不推荐附魔",
+          "totalLevels": null,
+          "minXp": null,
+          "expression": null,
+          "note": "wiki 明确不推荐：合成剪刀仅需2铁锭，成本远低于附魔。"
+        }
+      },
+      "targetPlaceholder": "shears"
+    }
+  },
+  "conflicts": [
+    [
+      "minecraft:protection",
+      "minecraft:fire_protection",
+      "minecraft:blast_protection",
+      "minecraft:projectile_protection"
+    ],
+    [
+      "minecraft:sharpness",
+      "minecraft:smite",
+      "minecraft:bane_of_arthropods"
+    ],
+    [
+      "minecraft:fortune",
+      "minecraft:silk_touch"
+    ],
+    [
+      "minecraft:frost_walker",
+      "minecraft:depth_strider"
+    ],
+    [
+      "minecraft:infinity",
+      "minecraft:mending"
+    ],
+    [
+      "minecraft:riptide",
+      "minecraft:loyalty",
+      "minecraft:channeling"
+    ],
+    [
+      "minecraft:multishot",
+      "minecraft:piercing"
+    ]
+  ]
+}

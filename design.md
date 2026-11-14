@@ -1,0 +1,277 @@
+# 自动附魔插件设计与开发方案
+
+## 1. 目标
+
+为 ZenithProxy BOT 实现长期运行的自动装备附魔：扫描附近铁砧和砂轮，从标记容器取待处理装备和附魔书，按选定方案执行低经验顺序，完成后卸货。混杂装备可以由红石机器预处理；插件也会按 PRESET/CUSTOM 策略自行判断是否使用砂轮。经验不足只通过本体 KillAura 刷怪获取。遇到单件装备无法完成时尽力卸出或丢弃当前事务物品，再继续下一件。
+
+默认面向 Minecraft Java Edition，实际规则按 ZenithProxy 支持的游戏版本复核。附魔指南作为版本化内置数据随插件发布，不运行时抓网页。
+
+## 2. 展示框作业声明与工作站
+
+布置方式决定作业从哪里来：**一个展示框 = 一种待附魔物品的模板**。展示框里放的是**说明书**（可以是用创造模式或铁砧预先做好的成品样件），不是真正要处理的那件装备；真正待处理的装备堆在展示框下方的取货箱里。
+
+- 展示框展示装备：扫描时读取该物品的**附魔词条**与**自定义名称**，生成/更新一条作业：
+  - 词条与某个 Wiki 预设的最终附魔集合完全相等 → `mode = PRESET`、`preset = 该变体`，直接沿用指南合并树；
+  - 否则 → `mode = CUSTOM`，`enchantments` 就是展示框物品拆解出的词条（等级照抄）；
+  - 展示框物品没有词条 → 退回该物品的默认预设（有 `all` 用 `all`），等于「照标准方案做」。
+- 展示框物品的自定义名称决定改名：有名字 → `renameEnabled = true`、`renameName = 名字`（超 50 字符截断）；没名字 → 不改名。
+- 该展示框**正下方第一个容器**就是这条作业的取货箱 `inputItemChest`。取货不再依赖红石粉标记；同一物品有多个展示框时保留第一个绑定的容器并报冲突。
+- 展示框**正上方的红石灯**是这条作业的启停开关：亮 = 启用，灭 = 停用；没有红石灯时保留 config 里 `set <item> on/off` 的设置。
+- 只把带 `max_damage` 组件的物品当作模板，装饰性展示框不会凭空生成条目。
+- **红石块**展示框：下方第一个容器 = 卸货箱 `outputChest`（成品）。
+- **红石粉**展示框：下方第一个容器 = 半成品/异常卸货箱 `semiFinishedChest`。
+- **附魔书**展示框：该书对应的取货容器，按附魔 ID 和等级匹配；**铁砧**展示框：铁砧补货容器 `anvilChest`。
+- 以上容器坐标都由 `scan` 写回**站点级**字段 `outputChest`/`semiFinishedChest`/`anvilChest`（`BlockPos`，全 0 表示未设置）。作业自己的 `outputChest`/`semiFinishedChest` 优先，未设置时自动继承站点级坐标，因此 `set <item> output ...` 钉死的坐标不会被扫描覆盖，而没钉过的作业也不需要逐个抄坐标。
+- 在 BOT 周围配置半径内自动搜索铁砧和砂轮；支持维度与方块坐标显式绑定。
+
+标记解析需校验容器类型、可访问性和重复绑定。所有标记（作业模板、书箱、铁砧补给、卸货、半成品）统一取**展示框正下方第一个容器**，深度由 `supplyScanDepth`（默认 8）控制；一条规则覆盖挂墙、放在架子上、离箱子两格等情况，不受展示框朝向影响。显式位置优先；标记或位置失效时对当前装备执行失败恢复并跳过，之后按 `restartDelayMs` 重新扫描。扫描只检查已加载区块；实际操作前复核方块、容器和库存。
+
+`scan` 只在模板内容**真的变化**时重新导入（`frameSpec` = 词条排序串 + 名称），所以 `set <item> enchants add/del` 的手工微调不会被下一次周期扫描覆盖；想回到展示框的定义，改一下展示框里的物品即可。
+
+位置优先级：**作业坐标 > 全局配置坐标 > 唯一标记绑定**。作业显式坐标是权威值，容器暂时不在时不会静默改用别的箱子，而是把装备留在背包里稍后重试。建议命令：`autoEnchant scan`、`autoEnchant list`、`autoEnchant set <item> input|output <x> <y> <z>`、`autoEnchant stations`。
+
+## 3. 配置模型：作业列表、方案来源与统一附魔条目
+
+每条作业明确指定**处理哪类装备**、**使用哪种方案**、**装卸在哪两个容器**。不建议将所有方案和附魔表写成 Java 枚举，也不建议预设与自定义采用两套数据模型。采用四层设计：
+
+1. `jobs[]` 一个条目一种物品，条目内保存全部运行所需信息。
+2. `item` 指定物品 ID；`mode` 用小枚举选择 `PRESET` 或 `CUSTOM`。
+3. `preset` 用稳定字符串 ID 选择预设；`enchantments` 存放自定义附魔条目。加载后两者统一解析成内部 `EnchantPlan`。
+4. `inputItemChest` / `outputChest` / `semiFinishedChest` / `renameEnabled` / `renameName` / `frameSpec` 逐条保存，互不影响。`frameSpec` 记录上次从展示框导入的模板签名（词条 + 名称），只在签名变化时重新导入。
+
+预设按装备槽位组织，与材质解耦：`item` 指定钻石/下界合金等具体装备，`helmet.all`、`helmet.no_thorns` 等槽位预设可供所有兼容头盔复用。变体内容放在版本化 JSON/YAML，不为每种方案写专门代码。枚举仅用于有限的方案来源类型和执行策略。配置校验器逐条校验并提供有效预设列表。
+
+```yaml
+jobs:
+  - item: minecraft:diamond_helmet
+    enabled: true
+    mode: PRESET            # NONE | PRESET | CUSTOM，NONE = 草稿，不参与轮转
+    preset: helmet.all      # autoEnchant set diamond_helmet preset <variant>
+    enchantments: []        # CUSTOM 模式使用 set <enchantItem> enchants add/del/clear
+    renameEnabled: true
+    renameName: "主力头盔"
+    inputChest: {x: 120, y: 64, z: -30}    # 展示框下方第一个容器
+    outputChest: {x: 0, y: 0, z: 0}        # 全 0 = 未设置，跟随站点级 outputChest
+    semiFinishedChest: {x: 0, y: 0, z: 0}
+    frame: "(119, 66, -30)"
+    frameSpec: "sharpness=5,looting=3,...|主力头盔"   # 上次从展示框导入的模板签名
+outputChest: {x: 122, y: 64, z: -30}       # 红石块展示框下方第一个容器
+semiFinishedChest: {x: 124, y: 64, z: -30} # 红石粉展示框下方第一个容器
+anvilSupplyChest: {x: 0, y: 0, z: 0}       # 铁砧展示框下方第一个容器
+anvilPositions: []
+grindstonePositions: []
+killSpot: {x: 110, y: 63, z: -25}          # 经验不足时先去这里挂机砍怪；全 0 = 原地
+renameOrder: FIRST
+```
+
+从各作业的取货箱里按 `item` 匹配装备，再由该作业的 `mode` 决定目标附魔集合；工作流按启用的作业轮转取货箱，空箱只跳过不阻塞其他作业。诅咒装备无论模式都跳过并卸货。PRESET 模式发现普通已有附魔时，先用砂轮处理为白板再按预设操作；CUSTOM 模式根据已有附魔、冲突和先前工作惩罚，比较直接附魔与祛魔后的预计费用/可行性，再决定是否使用砂轮。缺书、费用超限或输出不匹配只放弃当前装备，不暂停全局队列。未知预设/配置格式等启动问题持续记录并按重启延时重试，避免错误操作。
+
+作业由 `autoEnchant scan` 从展示框自动生成（启停由红石灯决定，无灯时保留配置值），或用 `autoEnchant add <item> [input <x> <y> <z>] [output <x> <y> <z>]` 手工建立。坐标字段全部是 `BlockPos`（序列化为 `{x,y,z}`，全 0 = 未设置），和村民交易插件一致；旧配置里的 `"x,y,z"` 字符串由 `AutoEnchantConfigSerializer` 在读取时转换，`containerPositions` 映射在首次使用时拆进站点级字段与各作业并清空。旧版单目标 `target` 和 `targets` 数组同样在首次使用时迁入 `jobs`：取第一条可用条目，全局 `renameEnabled`/`renameName` 一并搬进该条目。
+
+新建作业时，若展示框模板没有词条，则同步决定预设：兼容则取该物品的默认变体（有 `all` 用 `all`，否则取列表第一个），并把该预设的**最终附魔集合**复制进 `enchantments`；模板带词条时按词条比对预设树的最终集合，命中则 `PRESET`、否则 `CUSTOM`。`set <item> preset <variant>` 选定后同样刷新。这样 `mode custom` 的起点就是指南的目标集合，用户只需用 `enchants add/del` 改差异，不必从空列表逐条录入。复制的是最终等级（如 `sharpness 5`），与预设树的叶子书等级一致，书箱供货不需要额外准备低级书。
+
+## 4. 最佳附魔数据与费用规划
+
+内置方案以[中文 Wiki 最佳附魔指南](https://zh.minecraft.wiki/w/Tutorial:%E6%9C%80%E4%BD%B3%E9%99%84%E9%AD%94%E6%8C%87%E5%8D%97?variant=zh-cn)为来源。文件按槽位组织方案、变体、显示名称、目标装备占位符、推荐合并表达式、指南费用和互斥组，作为内置预设数据；自定义目标在主配置中声明并转换为同一内部模型。
+
+矛和突进附魔在 Java 1.21.11 加入，因此 1.21.4 数据集不含矛方案，1.21.11 数据集保留它。启动时加载与构建目标版本匹配的数据文件，并校验顶层 `dataVersion`；不匹配则拒绝加载。`totalLevels`、`minXp` 仅用于 dryRun 参考、表达式解析自检和验收基准，不参与运行时经验门槛判断；运行时门槛以服务器铁砧窗口费用预览为准。
+
+表达式语法为 `expression := term ("+" term)*`，`term := token | (expression) | [expression] | {expression}`，每个合并节点可带 `@integer` 费用注记；附魔 token 末尾的 `_integer` 表示等级。遍历采用后序顺序，不重排合并树：书与书的预合并及其结果书惩罚先完成，装备只在表达式指定的节点加入。JSON 的 `targetPlaceholder` 显式声明装备占位符；`misc_item` 在执行时替换为目标配置的物品，支持打火石、盾牌、胡萝卜钓竿、诡异菌钓竿、刷子和鞘翅。其他叶节点作为附魔书需求。
+
+规划需要考虑已有附魔、等级合并升阶、冲突、牺牲槽方向、书本折扣、先前工作惩罚和单次费用上限。常见互斥组包括保护系、锋利/亡灵杀手/节肢杀手、时运/精准采集、冰霜行者/深海探索者、无限/经验修补等，按目标版本数据化。
+
+铁砧费用通常包含输入物品先前工作惩罚、牺牲槽附魔费用（附魔书有折扣）和修理/改名费用。先前工作惩罚从物品数据读取：旧版本可能是 NBT `RepairCost`，新版本可能表现为 `minecraft:repair_cost` 组件，映射依协议版本/API 而定。不要从操作历史猜值；读取失败就把当前装备隔离/丢弃并继续，不假定为零。合并结果惩罚的常见增长为 `2 * max(leftPenalty, rightPenalty) + 1`；生存模式有“过于昂贵”上限。诅咒本身不是 prior-work penalty，不能按诅咒数量用 `2^n-1` 推导惩罚。
+
+PRESET 模式直接按 JSON 的 `expression` 逐步执行指南给出的低经验合并树；它可以包含书本预合并，也可以把装备插入树的中间步骤，因此不额外套用“所有书先合成一本”的固定策略。白板装备、空白惩罚、兼容版本和标准生存规则满足时，指南中的 `totalLevels`/`minXp` 可作为基准核对；执行仍以服务器预览为准。中断续做必须以同一棵合并树为基准：装备当前附魔集合要能对上树中某个已完成节点，已完成的子树整体复用、只补缺失分支，绝不为了“补齐”而自行改序或把缺失的书逐本硬叠到树上。对不上任何节点（例如被外部改动、只持有某个合并对的半个子集）就判定为不匹配并卸货到半成品箱；CUSTOM 模式没有指南树，用同一套费用模型从当前附魔与真实 `RepairCost` 重新规划最优树，不做逐本硬叠。
+
+实际执行以服务器铁砧窗口预览为准：费用、结果附魔和物品签名匹配预设表达式后才取出；不一致时终止该件装备的剩余步骤，卸入半成品容器或进入当前事务的丢弃恢复，再继续队列。
+
+### 4.1 祛魔判断
+
+所有输入先检查绑定诅咒和消失诅咒；发现任一诅咒，当前装备直接进入半成品卸货，不尝试砂轮，因为砂轮不会移除诅咒。无诅咒时按目标模式执行：
+
+- **PRESET**：预设表达式是针对白板装备设计的。若已有任何附魔，先将该装备放入附近/指定砂轮，等待输出并核实非诅咒附魔已清除，再从白板状态开始按推荐树附魔。砂轮交互失败或结果仍有附魔时，卸货并继续下一件。
+- **CUSTOM**：读取现有附魔、实际 `RepairCost`、目标附魔和冲突表，用 `CustomEnchantPlanner` 计算“保留现有附魔直接追加”的最优合并树及预计总等级；同时按目标集合计算“砂轮祛魔后重做”的预计费用。存在阻止必需目标的冲突、直接方案超过铁砧费用上限，或祛魔后总费用至少低于直接方案 `grindstoneThreshold` 时祛魔；否则保留现有附魔。祛魔后重新读取状态和惩罚并重算，不假定砂轮会清除诅咒/先前工作惩罚。
+
+两种模式都要检查砂轮方块可达且 GUI 可用。目标方案可配置 `customImpurityPolicy: SMART | ALWAYS_GRINDSTONE | NEVER_GRINDSTONE`；`SMART` 使用上述费用比较。砂轮通常会在清除非诅咒附魔后重置物品的先前工作惩罚，但每次都要读取并验证砂轮输出，不能直接沿用预计值。任何方案中的诅咒装备一律跳过。红石祛魔设备可作为前置过滤优化，插件检测结果后仍按这里的规则决定后续动作。
+
+## 5. 改名
+
+逐条作业配置 `renameEnabled` + `renameName`（指令 `autoEnchant set <item> rename set <name>` / `rename clear`）；`renameOrder` 仍是全局策略（`autoEnchant renameOrder first|last`）。名称最长 50 字符；`rename clear` 清空并关闭该作业的改名。名称已符合时不重复改名。
+
+**费用机制（决定改名位置）**：铁砧的「累积惩罚」按装备被操作的次数 n 计算，惩罚 = `2^n − 1`（0、1、3、7、15、31…），并且**只有改名不算一次 anvil use**，不提高惩罚。但改名本身的费用 = 1 级 + 物品当前的惩罚。因此：
+
+- 改名放在**第一次**装备铁砧操作（`renameOrder FIRST`，默认）：此时惩罚为 0，改名恒为 1 级，且不会让后续合并变贵。
+- 改名放在**最后一次**合并（`renameOrder LAST`）：该次操作要付 `合并费 + 已累积惩罚 + 1`，可能是 8、16、32 级，还会把本来就接近 39 级的最后一步推到「过于昂贵」。
+- 装备已经完成、只差名称：单独走一次「仅改名」铁砧流程，费用 = 1 + 当前惩罚（仅改名不受 39 级拒绝规则限制，但等级仍要够付）。
+
+同一个机制也解释了为什么预设必须走 Wiki 合并树：装备每被直接操作一次，惩罚就翻倍，而书与书之间的合并把惩罚留在书上。把书先合成、让装备尽量少动手，才是低经验解。
+
+CUSTOM 模式同样按这个结论规划：`CustomEnchantPlanner` 用与铁砧一致的费用模型（牺牲侧附魔按最终等级 × wiki 的 from-book multiplier 计费，另加两侧 `2^n−1` 惩罚，结果取 `max(n)+1`）在所有「书分组 + 分组顺序」上做精确子集 DP，输出总等级最低的合并树；总等级相同时取更低的最终惩罚，给后续补书留余量。可选的合并结构由铁砧本身决定：结果永远是左槽物品，所以装备只能作为左脊，规划问题就是「把书分成 k 组、每组内部合并成一本书、再把 k 本书按顺序拍到装备上」。书数 ≤ 10 走精确搜索（毫秒级），更多时退化为每 4 本平衡合并后按价值降序应用。任一操作预计超过 39 级即判定无解，装备送半成品箱，不会像逐本叠加那样中途崩掉。
+
+改名必须落在一次本来就要执行的「装备铁砧操作」上。表达式里的书本预合并节点不参与改名：只有结果含装备占位符的操作才允许附带 `RenameItem`。装备无需再附魔但缺少目标名称时，书本流程结束后单独走一次「只改名」铁砧流程（放入装备 → 改名 → 校验预览名称 → 取回），保证成品不会带着旧名字卸货。
+
+## 6. 工作流状态机
+
+主流程：
+
+`RUNNING → SCAN → TAKE_ONE → MATCH_TARGET → PLAN → ENSURE_XP → ENCHANT_STEP* → VERIFY → OUTPUT → SCAN`
+
+单件失败流程：`ITEM_FAILED → RECOVER_ITEM → OUTPUT_PARTIAL / QUARANTINE / DISCARD_CURRENT → BACKOFF → SCAN_NEXT`
+
+1. 扫描并验证容器、铁砧、砂轮、维度、位置和可达性。
+2. 从 `inputItemChest` 一次取一件装备，记录槽位与物品快照。
+3. 匹配目标；诅咒装备直接卸货。PRESET 带附魔装备先砂轮清白；CUSTOM 按惩罚、冲突及预估成本判断是否砂轮清白。
+4. 检查祛魔后的物品状态、本件附魔书、当前铁砧惩罚、费用和经验等级。
+5. KillAura 获取经验至本步门槛后停止/关闭本插件启动的 KillAura，再执行铁砧步骤。
+6. 每次交互按延时等待并核验服务端窗口状态；完成后校验成品。
+7. 成品送 `outputChest`；未完成或无效装备优先送 `semiFinishedChest`，未配置或已满时尝试送 `outputChest`，仍无法卸出则允许丢弃当前事务装备及相关附魔书，然后开始下一件。
+
+单件事务串行执行，通过窗口 ID、阶段号和槽位快照防止重复点击。已确认消耗的书不要求回滚。故障恢复仅处理本事务拿取的物品，不动玩家原有库存。
+
+### 6.1 持续运行策略
+
+工作循环不设因单件失败而进入的全局 `PAUSED` 状态。缺书、预设不适用、诅咒装备、费用超限、铁砧/砂轮损坏、输出不匹配、容器临时满等，记录原因并跳过当前装备；能卸出的半成品放入 `semiFinishedChest`，否则按 `failedItemPolicy` 对当前事务物品执行有限次恢复，最终可丢弃该装备及本事务附魔书，再继续。
+
+区块未加载、BOT 断线、没有可达铁砧、所有输出路径都不可用等情况无法立即完成游戏交互。此时保持插件运行，进入有上限的指数退避（上限由 `restartDelayMs` 控制），周期性重新扫描和恢复；不重复确认已完成的点击，也不把未解决事务标记为成功。连接恢复且环境可操作后继续队列。配置错误以显著日志/状态告警并周期重载；不能安全解析配置时不执行物品交互。
+
+持续运行指调度器不因单件问题停摆，不表示 BOT 离线时仍能推进。服务恢复后自动续跑。
+
+## 7. 经验来源模式
+
+经验来源固定为本体 `KILLAURA`，不实现 BOT 投掷 XP 瓶或红石 XP 瓶监控。每个铁砧步骤按服务器预览的实际费用换算当前等级门槛；不足时关闭容器，先寻路到配置的击杀点 `killSpot`（未配置则在原地），到达后启动本体 KillAura，达到 `requiredLevel + reserveLevels` 后立即关闭本插件启动的 KillAura 并继续附魔。前往击杀点是一段有超时（60 s）的寻路：超时或寻路失败按"无法获取经验"处理，当前装备卸货，不无限等待。BOT 传送、切维度、死亡、断线、健康值低于阈值、到达刷经验超时或经验无增长超时时立即停止插件启动的 KillAura，并将当前装备送入失败恢复流程。只管理插件启动的 KillAura；插件原已开启时不擅自关闭。设置 `killauraMaxSeconds`、`minimumHealth`、允许维度和无经验增长超时。刷怪超时后当前装备进入失败卸货流程，队列继续，后续周期再尝试。
+
+只管理插件启动的 KillAura；插件原已开启时不擅自关闭。KillAura 调用失败或无目标时记录本件失败并退避重试，不能让队列锁死。
+
+## 8. 操作延时与重启延时
+
+- `operationDelayMs`：两次改变游戏状态的交互之间基础等待时间，适用于容器点击、移动物品、砂轮/铁砧操作及放置铁砧等。服务端状态确认仍是继续操作的前提，延时不替代确认。可允许按操作类型覆写，并提供可关闭的小幅随机抖动。
+- `restartDelayMs`：断线重连、异常恢复或一轮失败后，重新扫描/继续队列之前等待的时间，避免重连后立刻重复操作。正常处理完一件装备不触发。
+- 另设 `windowTimeoutMs` 和 `retryLimit`。重试前读取服务端状态，先判断前次操作是否已经生效，避免重复提交非幂等点击。
+
+## 9. 铁砧损坏与补货
+
+使用前后复核铁砧方块状态；发现损坏或消失，立即停止当前装备操作并标记位置失效。补货时关闭窗口并确认光标槽安全，从 `anvilChest` 取一件铁砧，前往配置放置点，核验目标属于可替换白名单，放置后重新确认方块类型并更新工作站记录。当前装备无法继续时送入半成品流或丢弃事务物品；若当前没有可用铁砧，则不取新装备，调度器按重启延时退避扫描，补货成功后继续。默认不破坏原有方块；位置、朝向和替换白名单需要显式配置。
+
+## 10. 配置草案
+
+```yaml
+enabled: false
+scan:
+  radius: 16
+  verticalRadius: 8
+  intervalTicks: 100
+  loadedChunksOnly: true
+stations:
+  anvils: []
+  grindstones: []
+containers: # 全局兜底；作业自己的坐标优先
+  inputItemChest: null
+  outputChest: null
+  semiFinishedChest: null
+  anvilSupplyChest: null
+  supplyScanDepth: 8
+  allowExplicitFallback: false
+  semiFinishedMarkerItem: minecraft:gray_dye # 可配置为任意物品 ID
+timing:
+  operationDelayMs: 250
+  windowSettleDelayMs: 200
+  restartDelayMs: 3000
+  windowTimeoutMs: 5000
+  retryLimit: 2
+experience:
+  source: KILLAURA
+  reserveLevels: 2
+  killauraMaxSeconds: 900
+  minimumHealth: 12
+  noXpTimeoutMs: 60000
+  allowedXpDimensions: []
+workflow:
+  dryRun: false
+  presetImpurityPolicy: grindstone_to_blank
+  customImpurityPolicy: SMART # SMART | ALWAYS_GRINDSTONE | NEVER_GRINDSTONE
+  grindstoneThreshold: 10
+  cursedItemPolicy: skip_item
+  missingBookPolicy: skip_item
+  failedItemPolicy: semi_finished_then_discard
+  discardOnlyCurrentTransaction: true
+  maxRecoveryAttempts: 2
+  renameOrder: FIRST # FIRST | LAST，全局策略；是否改名逐作业保存
+jobs:
+  - item: minecraft:diamond_helmet
+    enabled: true
+    mode: PRESET # NONE | PRESET | CUSTOM
+    preset: helmet.all
+    enchantments: []        # CUSTOM 用；新建时由预设最终集合填充
+    renameEnabled: true
+    renameName: "主力头盔"
+    inputChest: {x: 120, y: 64, z: -30}
+    outputChest: {x: 0, y: 0, z: 0}   # 全 0 = 跟随站点级 outputChest
+    semiFinishedChest: {x: 0, y: 0, z: 0}
+    frame: "(119, 66, -30)"
+    customImpurityPolicy: ""   # 空 = 用全局
+    grindstoneThreshold: 0     # 0 = 用全局
+  - item: minecraft:diamond_sword
+    enabled: false            # 展示框上方的红石灯没亮
+    mode: PRESET
+    preset: sword.all
+    inputChest: {x: 130, y: 64, z: -30}
+    outputChest: {x: 132, y: 64, z: -30}
+```
+
+加载校验坐标、经验阈值、重复角色、预设是否存在、附魔 ID/等级、名称长度与方案模式，并逐条作业汇总问题；停用的作业只作为草稿，不参与校验阻塞。热重载在当前物品事务边界应用。`dryRun: true` 时只匹配目标、解析推荐表达式、计算预计费用和材料，不打开容器、不移动物品、不启用 KillAura、不执行铁砧操作。
+
+展示框丢失或物品被替换时记录告警，已绑定的作业坐标保留；作业显式坐标失效时不会静默换箱子，装备留在背包稍后重试。没有可验证的角色位置时不开始新物品事务，并按重启延时退避扫描；这不会冻结调度器。红石灯从亮变灭会在下一次扫描关闭该作业，已在处理的那一件按当前事务走完。
+
+互斥组按游戏版本数据化，可复用预设 JSON 顶层 `conflicts` 或独立规则文件；运行时结合物品可附魔性判断。PRESET 与 CUSTOM 的祛魔规则按 §4.1 执行，诅咒物品始终跳过。
+
+## 11. 异常处理与安全
+
+- 缺装备/书/铁砧/砂轮、诅咒物品、费用超限：跳过当前装备，记录原因并处理为半成品。
+- 槽位被玩家/漏斗改变：快照不匹配就取消当前事务，不碰陌生物品；恢复/丢弃只限事务物品。
+- 容器满：对当前装备尝试半成品容器，之后按失败策略丢弃本事务物品，继续队列。
+- 窗口超时/不同步：有限次重读和重试；无法确认则停止当前装备，不能盲目再点。
+- BOT 受伤、死亡、传送、切维度或断线：停止游戏交互，调度器保留检查点并退避重试；恢复后核验背包、光标槽和工作站再续跑。
+- 未知物品、诅咒、组件不可读：放入异常/半成品流；无法卸出时可丢弃本事务物品。
+- 错误分为 item-skip（跳过当前件）、transient-retry（退避后重试环境）、configuration-error（告警并定期重载）；不因单件错误永久暂停队列。
+- 日志显示当前状态、目标、费用、缺料和错误原因，不每 tick 输出。
+- 权限区分查看、控制、配置；KillAura 联动与铁砧放置可独立启用。
+
+## 12. 验收标准
+
+1. 自动扫描/手动绑定能识别工作站和容器角色并诊断冲突。
+2. 展示框扫描为每种装备生成一条作业：物品、取货箱、红石灯启停都落到该条目；装饰性展示框不生成条目，同物品多框报冲突。
+3. 多作业轮转：某个取货箱为空只跳过它，不阻塞其他作业；每件成品卸进该作业自己的 `outputChest`。
+4. 装备匹配后正确选择预设或自定义方案，两者进入同一内部计划。
+5. 费用规划考虑附魔兼容、先前工作惩罚、书本和改名费用、上限；每步与服务端预览核验。
+6. 支持逐作业关闭改名、指定名称和避免重复改名。
+7. 缺经验时仅通过本体 KillAura 刷取，达到经验等级门槛后继续。
+8. 操作延时与异常重启延时分开生效，不重复执行已确认操作。
+9. 铁砧耗尽能补货并验证；失败时当前装备转半成品/丢弃，队列继续。
+10. 缺资源、满箱、断线、重启、窗口延迟时调度器不永久停止；BOT 可交互后自动续跑。
+11. PRESET 带普通附魔的装备先砂轮清白；CUSTOM 按惩罚、冲突和成本决定是否祛魔；诅咒装备始终跳过。
+12. dry-run 不产生游戏状态变更；失败项不会重复消耗已确认的书本操作。
+
+## 13. 开发阶段
+
+1. 确认 ZenithProxy API、目标版本、窗口/物品数据读取及 KillAura 接口。
+2. 完成配置校验、命令、扫描、标记容器和显式绑定。
+3. 完成单件容器事务、状态确认、操作延时与恢复检查。
+4. 校验项目中的最佳附魔预设 JSON，按兼容版本整理数据集，完成 PRESET/CUSTOM 统一解析。
+5. 实现费用/组合搜索、改名费用规划及只预览模式。
+6. 实现铁砧执行、失败卸货/丢弃策略和补货。
+7. 实现 KillAura 经验联动、阈值滞回和持续运行恢复。
+8. 在目标版本核验冲突、费用上限、损坏、窗口同步和断线恢复。
+
+## 14. 实现前需要核实
+
+- 目标 Java 版本及是否兼容定制服务端铁砧规则；按构建版本选择拆分的预设数据集。
+- ZenithProxy API 是否能读取铁砧预览费用、先前工作惩罚、槽位和方块状态。
+- “展示框下两格”的精确坐标语义。
+- 允许 KillAura 刷取经验的维度/区域及 KillAura 本体模块调用方式。
+- “最佳”是否以最低总经验消耗为首要目标。
+
+## 参考资料
+
+- [中文 Minecraft Wiki：教程/最佳附魔指南](https://zh.minecraft.wiki/w/Tutorial:%E6%9C%80%E4%BD%B3%E9%99%84%E9%AD%94%E6%8C%87%E5%8D%97?variant=zh-cn)（预设来源；导入后按目标版本复核）
+- [Minecraft Wiki：Anvil mechanics](https://minecraft.fandom.com/wiki/Anvil_mechanics)（铁砧费用与惩罚参考，实施前按目标版本复核）
