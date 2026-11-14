@@ -118,8 +118,6 @@ final class EnchantWorkflowWorker {
      * and every book withdrawal bounces off it and the item is retried forever instead of being unloaded.
      */
     private boolean flushing;
-    /** Set once a flush fell back to the overflow container because the output container would not take the piece. */
-    private boolean flushOverflow;
     /** Free player slots a transaction wants: the equipment piece itself, one book, and the anvil result. */
     private static final int FREE_SLOTS_FOR_TRANSACTION = 3;
     /**
@@ -512,7 +510,7 @@ final class EnchantWorkflowWorker {
         }
         if (!applyResumePlan(current)) {
             // A carried piece is work the BOT already paid for: unless it is genuinely too expensive to touch again,
-            // it stays in the bag and cools down for a while instead of being dropped into the overflow container.
+            // it stays in the bag and cools down for a while instead of being dropped at the unload chest.
             // Only a piece that came out of a supply chest (another job's property) is unloaded on a mismatch.
             parkCarried(failureReason == null ? "not a node of the preset tree" : failureReason);
             return;
@@ -1589,25 +1587,13 @@ final class EnchantWorkflowWorker {
     }
 
     /**
-     * A flush could not store its piece. The overflow container is the natural fallback (a full output chest is
-     * exactly the situation where the finished pieces piled up in the bag in the first place); when that is missing or
-     * was already tried, the workflow waits for a human to empty or restock the output container.
+     * A flush could not store its piece. There is only one unload chest per job (the equipment frame's container), so
+     * re-opening it would just bounce off the same full chest: the finished products of this job step aside together
+     * (a full chest would otherwise be retried once per product) and the workflow keeps cycling, so another job can
+     * still work while somebody empties the chest.
      */
     private void flushBlocked(String reason) {
         trace("flush could not store the finished product: {}", reason);
-        if (!flushOverflow) {
-            var overflow = module.containerPosition(target, "overflow");
-            if (overflow.isPresent()) {
-                flushOverflow = true;
-                module.setWorkflowStatus("Output container refuses the finished product (" + reason
-                    + "); unloading it to the overflow container instead");
-                if (openContainerId() != 0) closeContainer(State.POST_ENCHANT); else state = State.POST_ENCHANT;
-                return;
-            }
-        }
-        // No container takes the piece. The finished products of this job step aside together (a full chest would
-        // otherwise be retried once per product) and the workflow keeps cycling, so another job can still work while
-        // somebody empties the chest.
         reportOutOfStock("store:" + target.displayName(),
             "an unload container for job " + target.displayName() + " (" + reason + ")", target);
     }
@@ -1627,9 +1613,9 @@ final class EnchantWorkflowWorker {
             return;
         }
         if (openContainerId() != 0) { closeContainer(State.POST_ENCHANT); return; }
-        // A successful item goes to the output chest. A failed item goes to the overflow chest, or
-        // back to the input chest when the job's post-enchant mode asks for it; either falls back to
-        // the output chest when its own container is not configured.
+        // A successful item goes to the unload chest. A failed (half-done) item goes to the same chest, or back to the
+        // input chest when the job's post-enchant mode asks for it. "overflow" is only a role name now: it resolves to
+        // the job's output chest, because finished and half-done pieces share one container.
         State goTo;
         String role;
         if (failureReason == null) {
@@ -1644,31 +1630,22 @@ final class EnchantWorkflowWorker {
         }
         Optional<BlockPos> output = module.containerPosition(target, role);
         if (output.isEmpty() && role.equals("input")) {
-            output = module.containerPosition(target, "overflow");
+            output = module.containerPosition(target, "output");
             if (output.isPresent()) goTo = State.POST_ENCHANT_OVERFLOW_GO_TO;
         }
-        if (output.isEmpty() && !role.equals("output")) {
-            output = module.containerPosition(target, "output");
-            if (output.isPresent()) goTo = State.STORE_GO_TO_CHEST;
-        }
         if (flushing) {
-            // A flush exists to free a slot, so it takes whatever container accepts the piece: the output chest first
-            // (that is where finished products belong) and the overflow chest when the output one is missing or was
-            // just found full.
-            role = flushOverflow ? "overflow" : "output";
+            // A flush exists to free a slot, so it uses the unload chest directly: there is no second container to fall
+            // back to, and retrying the same chest would only bounce off it again.
+            role = "output";
             goTo = State.STORE_GO_TO_CHEST;
             output = module.containerPosition(target, role);
-            if (output.isEmpty() && !flushOverflow) {
-                output = module.containerPosition(target, "overflow");
-                if (output.isPresent()) flushOverflow = true;
-            }
         }
         if (output.isEmpty()) {
             if (flushing) {
                 // Nothing can take the piece: report it, park the finished products of this job and keep cycling.
                 reportOutOfStock("store:" + target.displayName(),
                     "an unload container for job " + target.displayName()
-                        + " (no output or overflow container is bound)", target);
+                        + " (no unload chest is bound)", target);
                 return;
             }
             // Keep the enchantItem in the BOT inventory instead of dropping it; the next cycle resumes it once the
@@ -1678,7 +1655,10 @@ final class EnchantWorkflowWorker {
             return;
         }
         openingPosition = output.get();
-        trace("unload via {} container {} (failure={}, item={})", role, openingPosition,
+        // "overflow" no longer names a second chest, so the trace says what the chest is (the unload chest) instead of
+        // implying the piece goes somewhere else than a finished product.
+        String roleLabel = "overflow".equals(role) ? "unload" : role;
+        trace("unload via {} container {} (failure={}, item={})", roleLabel, openingPosition,
             failureReason == null ? "none" : failureReason, module.describeItem(itemSnapshot));
         state = goTo;
     }
@@ -1700,7 +1680,7 @@ final class EnchantWorkflowWorker {
     /**
      * The only genuine enchant failure: the anvil refuses the operation because its level cost is too high. Anything
      * else - a chest that did not open, a book that was not transferred, a level that is merely not reached yet - must
-     * never be reported as a failed enchant and must never push the item to the overflow container.
+     * never be reported as a failed enchant and must never push the item out to the unload chest.
      */
     private void failPermanently(String reason) {
         State from = state;
@@ -1751,7 +1731,7 @@ final class EnchantWorkflowWorker {
     /**
      * Leaves a carried piece where it is instead of unloading it: the bag slot is kept, the piece drops out of the
      * rotation for {@code SKIP_COOLDOWN_MS}, and the next carried/chest item gets its turn in the meantime. This is
-     * the "no half-finished piece is thrown into the overflow container while it can still be worked on" rule.
+     * the "no half-finished piece is dumped into the unload chest while it can still be worked on" rule.
      */
     private void parkCarried(String reason) {
         if (itemSnapshot != null) {
@@ -1850,7 +1830,7 @@ final class EnchantWorkflowWorker {
             openAttempts = 0;
             if (flushing) {
                 // A missing or full unload container is exactly what strands the finished products in the bag: try the
-                // overflow container, then tell the operator instead of re-clicking the same spot forever.
+                // unload chest, then tell the operator instead of re-clicking the same spot forever.
                 flushBlocked("could not open " + openingPosition + ": " + reason);
                 return;
             }
@@ -2238,7 +2218,6 @@ final class EnchantWorkflowWorker {
         transactionStartedAt = 0;
         outputStored = false;
         flushing = false;
-        flushOverflow = false;
         depositSlots = List.of();
         depositRetries = 0;
         closeResent = false;
@@ -2388,7 +2367,6 @@ final class EnchantWorkflowWorker {
         backToBooks = false;
         outputStored = false;
         flushing = true;
-        flushOverflow = false;
         flushTrips++;
         depositSlots = List.of();
         depositRetries = 0;

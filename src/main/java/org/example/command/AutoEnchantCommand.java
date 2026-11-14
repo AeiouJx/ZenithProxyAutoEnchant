@@ -107,8 +107,7 @@ public class AutoEnchantCommand extends Command {
                         "set <id> enchants del <enchantment>",
                         "set <id> enchants clear",
                         "set <id> enchants list",
-                        "set <id> postEnchantStore <none/to_restock/to_overflow>",
-                        "set <id> overflowChest <x> <y> <z>"
+                        "set <id> postEnchantStore <none/to_restock/to_overflow>"
                     );
                     c.getSource().getEmbed()
                         .title("Enchant Settings")
@@ -356,29 +355,6 @@ public class AutoEnchantCommand extends Command {
                             .title("Post Enchant Store Mode Set");
                         return OK;
                     })))
-                    .then(literal("overflowChest").then(argument("overflowChestPos", blockPos()).executes(c -> {
-                        var id = CustomStringArgumentType.getString(c, "id");
-                        if (!PLUGIN_CONFIG.enchants.containsKey(id)) {
-                            c.getSource().getEmbed()
-                                .title("Enchant ID Not Found")
-                                .addField("ID", id)
-                                .description(printAllEnchants());
-                            c.getSource().getData().put("list", true);
-                            return ERROR;
-                        }
-                        var trade = PLUGIN_CONFIG.enchants.get(id);
-                        var pos = getBlockPos(c, "overflowChestPos");
-                        if (World.isChunkLoadedBlockPos(pos.x(), pos.z())) {
-                            var storeChestBlock = World.getBlock(pos);
-                            c.getSource().getEmbed()
-                                .addField("Block At Overflow Pos", storeChestBlock.name());
-                        }
-                        trade.overflowChestPos = pos;
-                        inEventLoop(() -> MODULE.get(AutoEnchantModule.class).onTradeListChange());
-                        c.getSource().getEmbed()
-                            .title("Overflow Chest Set");
-                        return OK;
-                    })))
                 )
             )
             .then(literal("del").then(argument("id", wordWithChars()).executes(c -> {
@@ -477,11 +453,12 @@ public class AutoEnchantCommand extends Command {
                 if (!module.markerProblems().isEmpty()) embed.addField("Marker issues", String.join("\n", module.markerProblems()), false);
                 embed.addField("Note", "A frame showing equipment is the template for that enchantItem: its enchantments "
                     + "become the target set (a wiki leaf tree match = PRESET, otherwise CUSTOM) and its custom name "
-                    + "becomes the rename target. The first container below it is the finished chest, and the first "
+                    + "becomes the rename target. The first container below it is the unload chest, used for finished "
+                    + "and half-done pieces alike, and the first "
                     + "redstone lamp in the column above it (up to 8 blocks, it need not touch the frame) switches the "
                     + "job on (lit) or off (unlit). The pickup chest is the first container "
-                    + "below the redstone-dust frame, the semi-finished chest the first container below the "
-                    + "redstone-block frame. Only chests, barrels and shulker boxes count as containers.", false);
+                    + "below the redstone-dust frame. Only chests, barrels and shulker boxes count as containers; a "
+                    + "redstone-block frame is ignored.", false);
                 return OK;
             }));
     }

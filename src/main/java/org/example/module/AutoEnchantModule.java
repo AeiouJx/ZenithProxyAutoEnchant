@@ -234,6 +234,10 @@ public class AutoEnchantModule extends Module {
             if (shown == null) continue;
             String role = markerRole(shown);
             if (role == null) {
+                // A redstone-block frame used to mark the semi-finished chest. That chest no longer exists (finished and
+                // half-done pieces both leave through the equipment frame's container), so a leftover marker is
+                // skipped silently instead of showing up as an unrecognised frame.
+                if (shown.getId() == com.zenith.mc.item.ItemRegistry.REDSTONE_BLOCK.id()) continue;
                 // Not a book/anvil/redstone marker: a damageable enchantItem here declares a job for that item type.
                 JobFrame jobFrame = jobFrame(entity, shown);
                 if (jobFrame == null) {
@@ -434,8 +438,13 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
-     * Persists the container roles declared by their own frames: the redstone-block frame binds every job that has no
-     * output chest, an anvil frame binds the anvil supply and a book frame binds that enchantment's book container.
+     * Persists the container roles declared by their own frames: the redstone-dust frame binds every job's pickup
+     * chest, an anvil frame binds the anvil supply and a book frame binds that enchantment's book container.
+     *
+     * <p>The unload chest is not bound here: it is the equipment frame's own container (the job's
+     * {@code outputChest}), which serves both finished and half-done pieces. A {@code overflowChestPos} from an older
+     * config is dropped by {@code AutoEnchantConfigSerializer} so a job cannot keep sending pieces to a chest that is
+     * no longer scanned.
      */
     private boolean applyMarkerBindings(List<Marker> foundMarkers) {
         AutoEnchantConfig config = AutoEnchantPlugin.PLUGIN_CONFIG;
@@ -449,13 +458,6 @@ public class AutoEnchantModule extends Module {
                 for (AutoEnchantConfig.Enchant job : config.enchants.values()) {
                     if (job == null || pos.equals(job.inputItemChest)) continue;
                     job.inputItemChest = pos;
-                    changed = true;
-                }
-            } else if ("overflow".equals(role)) {
-                // The redstone-block frame holds semi-finished leftovers and failed items.
-                for (AutoEnchantConfig.Enchant job : config.enchants.values()) {
-                    if (job == null || pos.equals(job.overflowChestPos)) continue;
-                    job.overflowChestPos = pos;
                     changed = true;
                 }
             } else if ("anvil_supply".equals(role)) {
@@ -501,8 +503,8 @@ public class AutoEnchantModule extends Module {
         if (job == null) return false;
         return switch (role) {
             case "input" -> !BlockPos.ZERO.equals(job.inputItemChest);
-            case "output" -> !BlockPos.ZERO.equals(job.outputChest);
-            case "overflow" -> !BlockPos.ZERO.equals(job.overflowChestPos);
+            // Both unload roles are the job's own equipment-frame chest.
+            case "output", "overflow" -> !BlockPos.ZERO.equals(job.outputChest);
             default -> false;
         };
     }
@@ -532,7 +534,7 @@ public class AutoEnchantModule extends Module {
 
     /**
      * Every marker resolves to the first container below its frame: book chests, anvil supply, the pickup chest
-     * (redstone dust), the semi-finished chest (redstone block) and the finished chest (the equipment frame itself).
+     * (redstone dust) and the unload chest (the equipment frame itself, used for finished and half-done pieces alike).
      * One rule for all roles means a frame on a wall, a shelf, or several blocks above a container all work, and the
      * layout never depends on the frame's facing. Only chests, barrels and shulker boxes are accepted as a target.
      */
@@ -663,13 +665,16 @@ public class AutoEnchantModule extends Module {
      * Resolves one container role for a job. The job's own coordinate is authoritative (and never silently replaced by
      * another chest when its block is missing), then a station-level chest from config, then a unique marker binding.
      * {@code job} may be null for roles that are not job-specific, such as the anvil supply container.
+     *
+     * <p>{@code output} and {@code overflow} are the same chest on purpose: the equipment frame's container is the one
+     * unload chest, and finished pieces, half-done pieces and failed items all go back there. "overflow" is kept as a
+     * role name so the states and command modes that mention it still resolve to something real.
      */
     public java.util.Optional<BlockPos> containerPosition(AutoEnchantConfig.Enchant job, String role) {
         if (job != null) {
             BlockPos owned = switch (role) {
                 case "input" -> job.inputItemChest;
-                case "output" -> job.outputChest;
-                case "overflow" -> BlockPos.ZERO.equals(job.overflowChestPos) ? job.outputChest : job.overflowChestPos;
+                case "output", "overflow" -> job.outputChest;
                 default -> null;
             };
             if (owned != null && !BlockPos.ZERO.equals(owned)) return java.util.Optional.of(owned);
@@ -762,10 +767,10 @@ public class AutoEnchantModule extends Module {
     }
 
     private String markerRole(ItemStack shown) {
-        // Role names match the container roles resolved by containerPosition(): the dust frame is the pickup chest,
-        // the redstone-block frame the semi-finished/overflow chest, and an equipment frame is the finished chest.
+        // Role names match the container roles resolved by containerPosition(): the dust frame is the pickup chest and
+        // an equipment frame is the unload chest. There is no separate semi-finished marker any more: finished and
+        // half-done pieces both leave through the equipment frame's own container.
         if (shown.getId() == com.zenith.mc.item.ItemRegistry.REDSTONE.id()) return "input";
-        if (shown.getId() == com.zenith.mc.item.ItemRegistry.REDSTONE_BLOCK.id()) return "overflow";
         if (isAnvilItem(shown)) return "anvil_supply";
         if (shown.getId() == com.zenith.mc.item.ItemRegistry.ENCHANTED_BOOK.id()) {
             var component = shown.getDataComponentsOrEmpty().get(DataComponentTypes.STORED_ENCHANTMENTS);

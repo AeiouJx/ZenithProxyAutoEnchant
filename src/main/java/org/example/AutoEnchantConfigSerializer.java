@@ -27,7 +27,7 @@ public final class AutoEnchantConfigSerializer implements ConfigSerializer {
     private static final List<String> ROOT_POSITIONS = List.of("killSpot", "grindstone", "anvil", "anvilChest");
     /** Position fields of one enchant entry. */
     private static final List<String> ENCHANT_POSITIONS =
-        List.of("inputItemChest", "outputChest", "overflowChestPos");
+        List.of("inputItemChest", "outputChest");
     /** Legacy job lists, migrated into the keyed {@code enchants} map. */
     private static final List<String> LEGACY_JOB_LISTS = List.of("jobs", "targets");
 
@@ -169,7 +169,10 @@ public final class AutoEnchantConfigSerializer implements ConfigSerializer {
         JsonObject object = job.getAsJsonObject();
         rename(object, "enchantItem", "item");
         rename(object, "inputChest", "inputItemChest");
-        rename(object, "semiFinishedChest", "overflowChestPos");
+        // The separate semi-finished chest is gone: finished and half-done pieces share the output chest, so an old
+        // coordinate is dropped instead of being migrated into a role that no longer reads it.
+        object.remove("semiFinishedChest");
+        object.remove("overflowChestPos");
         rename(object, "postJobStoreMode", "postEnchantStoreMode");
         convertEnchantmentList(object);
         normalizeEnchantmentMap(object);

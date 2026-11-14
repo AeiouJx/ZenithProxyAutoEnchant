@@ -55,11 +55,13 @@ public class AutoEnchantConfig {
 
         public PostEnchantStoreMode postEnchantStoreMode = PostEnchantStoreMode.NONE;
         public enum PostEnchantStoreMode {
+            /** Keep a failed piece in the BOT inventory and retry it instead of storing it. */
             NONE,
+            /** Failed (half-done) pieces go back to the shared pickup chest. */
             TO_RESTOCK,
+            /** Failed (half-done) pieces go to the unload chest, i.e. the job's output chest / equipment frame. */
             TO_OVERFLOW
         }
-        public BlockPos overflowChestPos = BlockPos.ZERO;
         public Object2IntLinkedOpenHashMap<String> itemEnchantments = new Object2IntLinkedOpenHashMap<>();
 
         public String displayName() {
