@@ -9,6 +9,8 @@ import com.zenith.feature.inventory.actions.DropItem;
 import com.zenith.feature.inventory.actions.RenameItem;
 import com.zenith.feature.inventory.actions.ShiftClick;
 import com.zenith.feature.pathfinder.PathingRequestFuture;
+import com.zenith.feature.player.Input;
+import com.zenith.feature.player.InputRequest;
 import com.zenith.feature.player.World;
 import com.zenith.feature.inventory.util.InventoryActionMacros;
 import com.zenith.discord.Embed;
@@ -235,9 +237,12 @@ final class EnchantWorkflowWorker {
                 // Keep walking; the future resolves once the click was actually executed.
                 return;
             } else if (!pathFuture.isAccepted() || System.currentTimeMillis() > deadline) {
+                // Distinguish "the pathfinder never got there" from "the click ran but no window appeared": the first
+                // is a reachability problem, the second means the block is not a usable container right now.
+                boolean noPath = !pathFuture.isAccepted();
                 pathFuture = null;
                 // No counter and no retry bookkeeping: the open state is simply entered again.
-                reopenContainer("could not open " + openingPosition);
+                reopenContainer(noPath ? "no path to " + openingPosition : "no window after clicking " + openingPosition);
                 return;
             } else return;
         }
@@ -1857,11 +1862,86 @@ final class EnchantWorkflowWorker {
                         + " (could not open " + openingPosition + ": " + reason + ")", target);
                 return;
             }
+            // A supply/pickup container that does not open at all is unusable right now, exactly like an empty one:
+            // reporting it as a stockout makes the rotation skip it and lets the other jobs continue, instead of
+            // retrying the same spot forever and inflating the transient-retry counter.
+            if (reportUnopenableContainer(reason)) return;
             keepAndRetry("Could not open " + openingPosition + " after " + MAX_OPEN_ATTEMPTS + " attempts: " + reason);
             return;
         }
+        // The trader's trick for a container that refuses to open while the BOT stands on or next to it: sneak once
+        // before clicking again, so the click is not consumed as an item use and the interaction is re-sent cleanly.
+        if (openAttempts == 1) sneakForContainerOpen();
         module.setWorkflowStatus("Reopening " + openingPosition + ": " + reason);
         if (openContainerId() != 0) closeContainer(openState); else state = openState;
+    }
+
+    /**
+     * Reports a container that will not open at all as out of stock for its own family, so the pickup rotation can
+     * skip it while the rest of the work continues. The message carries the distance from the BOT: a chest that is
+     * simply too far away is a setup problem the operator has to see, not something a retry can fix.
+     *
+     * @return true when the failure belonged to a container family that is handled this way
+     */
+    private boolean reportUnopenableContainer(String reason) {
+        if (openingPosition == null) return false;
+        String where = openingPosition + " (" + String.format(java.util.Locale.ROOT, "%.1f", distanceTo(openingPosition))
+            + " blocks away, cache shows " + blockAt(openingPosition) + ")";
+        String key;
+        String what;
+        switch (openState) {
+            case RESTOCK_INPUT_GO_TO_CHEST -> {
+                key = "input@" + openingPosition;
+                what = "the pickup chest at " + where + " does not open (" + reason + ")";
+            }
+            case RESTOCK_ENCHANTED_BOOK_GO_TO_CHEST -> {
+                key = "bookchest@" + openingPosition;
+                what = "the book chest at " + where + " does not open (" + reason + ")";
+            }
+            case RESTOCK_ANVIL_GO_TO_CHEST -> {
+                key = "anvil_supply@" + openingPosition;
+                what = "the anvil supply container at " + where + " does not open (" + reason + ")";
+            }
+            case GRINDSTONE_GO_TO_CHEST -> {
+                key = "grindstone@" + openingPosition;
+                what = "the grindstone at " + where + " does not open (" + reason + ")";
+            }
+            default -> {
+                return false;
+            }
+        }
+        reportOutOfStock(key, what);
+        return true;
+    }
+
+    /** Straight-line distance from the BOT to a block position, used only to describe a container that will not open. */
+    private double distanceTo(BlockPos pos) {
+        var player = CACHE.getPlayerCache().getThePlayer();
+        if (player == null || pos == null) return -1;
+        double dx = player.getX() - (pos.x() + 0.5);
+        double dy = player.getY() - pos.y();
+        double dz = player.getZ() - (pos.z() + 0.5);
+        return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    /**
+     * Name of the block the cache holds at a position. A container that will not open is either gone (the cache still
+     * shows it, the server does not) or out of reach, and this one word tells the two apart in the log.
+     */
+    private String blockAt(BlockPos pos) {
+        if (pos == null) return "unknown";
+        if (!World.isChunkLoadedBlockPos(pos.x(), pos.z())) return "chunk-not-loaded";
+        var block = World.getBlock(pos.x(), pos.y(), pos.z());
+        return block == null ? "unknown" : block.name();
+    }
+
+    /** Sneaks for one input request: the trader's fix for a container that refuses to open next to the BOT. */
+    private void sneakForContainerOpen() {
+        INPUTS.submit(InputRequest.builder()
+            .owner(this)
+            .priority(actionPriority())
+            .input(Input.builder().sneaking(true).build())
+            .build());
     }
 
     /**
