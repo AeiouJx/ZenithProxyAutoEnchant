@@ -91,10 +91,22 @@ final class EnchantWorkflowWorker {
     /** What the BOT is currently waiting on at a supply chest, so the same restock warning is not repeated. */
     private String supplyWarnedFor = "";
     private long supplyWarnedAt;
-    /** What the BOT is waiting for right now, kept for the status line of the wait itself. */
-    private String supplyWaitingFor = "";
-    /** How often a supply gap is looked at again, and how often the same warning may be repeated. */
-    private static final long SUPPLY_RETRY_MS = 60_000L;
+    /**
+     * Containers that turned out to be out of stock, keyed by the resource they were supposed to hold (a book id and
+     * level, a pickup chest position, a container role) and carrying the next time they may be looked at again.
+     *
+     * <p>An empty container never stops the workflow: the piece that needs it steps aside until the recheck, the
+     * pickup branch runs again immediately, and every other chest, job and carried item keeps its turn. There is no
+     * minute-long freeze - the first recheck is a couple of seconds away and the interval only doubles while the same
+     * container keeps coming up empty.
+     */
+    private final Map<String, Stockout> stockouts = new LinkedHashMap<>();
+    /** First recheck of an out-of-stock container; doubled per consecutive miss, capped at the maximum. */
+    private static final long STOCKOUT_BASE_MS = 2_000L;
+    private static final long STOCKOUT_MAX_MS = 30_000L;
+    /** A stockout nobody reported for this long is forgotten, so the status line stays current. */
+    private static final long STOCKOUT_EXPIRY_MS = 600_000L;
+    /** How often the same restock warning may be repeated. */
     private static final long SUPPLY_WARN_INTERVAL_MS = 600_000L;
     /** True once the finished enchantItem left the BOT inventory, i.e. the output step really completed. */
     private boolean outputStored;
@@ -132,8 +144,6 @@ final class EnchantWorkflowWorker {
     private String lastPlanSignature = "";
     /** Position in the pickup-chest rotation, so an empty chest is skipped instead of retried forever. */
     private int inputCursor;
-    /** Consecutive empty pickup chests; a full empty round backs off instead of re-opening them nonstop. */
-    private int emptyChestStreak;
     private static final int MAX_ANVIL_RECOVERY = 3;
     /** The one genuine enchant failure: the server refuses the operation because its level cost is too high. */
     private static final int TOO_EXPENSIVE_LEVEL = 40;
@@ -335,7 +345,7 @@ final class EnchantWorkflowWorker {
             String gap = supplyPauseSummary();
             module.setWorkflowStatus(gap != null ? gap : "Waiting for a restock before the next enchantItem");
             state = State.AWAIT_RESTOCK;
-            deadline = System.currentTimeMillis() + 1_000L;
+            deadline = nextStockoutCheckAt();
             return;
         }
         // Nothing of ours to resume, but the bag is too full to fetch another piece: unload finished products that are
@@ -348,11 +358,20 @@ final class EnchantWorkflowWorker {
         int freeSlots = freeInventorySlots();
         if (freeSlots < 1) {
             if (flushFinishedProduct("no free slot left in the bag")) return;
-            // Nothing unloadable is left in the bag: opening the input chest would only have the withdraw click bounce
-            // off a full inventory. Say so once and look again in a minute instead of spinning on the chest.
-            waitForRoom("free space in the BOT inventory (the bag is full and no finished product is left to unload)");
+            // Nothing unloadable is left in the bag. Opening the pickup chest would only bounce the withdraw click off
+            // a full inventory, so the bag is reported as the thing that is out of stock and the loop keeps cycling
+            // (other jobs included) instead of standing still.
+            if (isOutOfStock("bag")) {
+                module.setWorkflowStatus(idleStatus());
+                state = State.AWAIT_RESTOCK;
+                deadline = nextStockoutCheckAt();
+                return;
+            }
+            reportOutOfStock("bag", "bag space for the next enchantItem (the bag is full and no finished product is "
+                + "left to unload)");
             return;
         }
+        clearStockouts("bag");
         if (freeSlots < FREE_SLOTS_FOR_TRANSACTION && flushFinishedProduct("only " + freeSlots + " free slot(s) left")) return;
         if (module.stations().getOrDefault("anvil", List.of()).isEmpty()) {
             module.setWorkflowStatus("Waiting for a loaded anvil");
@@ -367,9 +386,18 @@ final class EnchantWorkflowWorker {
             deadline = System.currentTimeMillis() + Math.max(500L, AutoEnchantPlugin.PLUGIN_CONFIG.restartDelay * 50L);
             return;
         }
+        // Chests that were just found empty wait for their recheck; the rotation continues with the others instead of
+        // reopening the same empty container, and only when every chest is out of stock does the workflow idle.
+        List<BlockPos> inStock = chests.stream().filter(pos -> !isOutOfStock("input@" + pos)).toList();
+        if (inStock.isEmpty()) {
+            module.setWorkflowStatus(idleStatus());
+            state = State.AWAIT_RESTOCK;
+            deadline = nextStockoutCheckAt();
+            return;
+        }
         origin = Origin.INPUT_CHEST;
         // Rotate through the pickup chests so one empty chest never starves the other jobs.
-        openingPosition = chests.get(Math.floorMod(inputCursor, chests.size()));
+        openingPosition = inStock.get(Math.floorMod(inputCursor, inStock.size()));
         activeContainerId = 0;
         state = State.EVAL_RESTOCK;
     }
@@ -542,19 +570,14 @@ final class EnchantWorkflowWorker {
             break;
         }
         if (selected < 0) {
-            // Nothing this chest can serve: move the rotation on so the other jobs keep getting a turn.
+            // Nothing this chest can serve. The rotation moves on at once so the next chest (and the next job) still
+            // gets its turn; only this chest is marked out of stock, and even that is revisited within seconds.
             inputCursor++;
-            emptyChestStreak++;
-            // Back off exponentially: re-opening the same empty chest every second looks like a bot and costs nothing
-            // to avoid. Capped at 30s, reset as soon as any chest yields an item.
-            long base = Math.max(2_000L, AutoEnchantPlugin.PLUGIN_CONFIG.restartDelay * 50L);
-            long pause = Math.min(30_000L, base << Math.min(emptyChestStreak - 1, 4));
-            deadline = System.currentTimeMillis() + pause;
-            closeContainer(State.AWAIT_RESTOCK);
-            module.setWorkflowStatus("No enabled job enchantItem in this chest; next try in " + (pause / 1000) + "s");
+            reportOutOfStock("input@" + openingPosition,
+                "an enchantItem for an enabled job in the pickup chest at " + openingPosition);
             return;
         }
-        emptyChestStreak = 0;
+        clearStockouts("input@");
         // Stay on the chest that just worked instead of re-probing the empty ones in front of it.
         int workedAt = inputChests(module.runnableJobs()).indexOf(openingPosition);
         if (workedAt > 0) inputCursor = workedAt;
@@ -754,7 +777,7 @@ final class EnchantWorkflowWorker {
         int free = freeInventorySlots();
         if (free < 1) {
             if (flushFinishedProduct("no free slot for the withdrawal")) return;
-            waitForRoom("a free slot in the BOT inventory to take the withdrawal");
+            reportOutOfStock("bag", "bag space to take the withdrawal from the pickup chest");
             return;
         }
         int wanted = Math.max(1, Math.min(target.inputItemRestockStacks, free));
@@ -863,41 +886,111 @@ final class EnchantWorkflowWorker {
     }
 
     /**
-     * Waits for a human to restock instead of failing the enchantItem.
+     * Records that a container (or the bag) had nothing to give, and keeps the workflow moving instead of freezing it.
      *
-     * <p>A book the supply chest does not have is not the BOT's failure: the item keeps every bit of progress it has,
-     * the transaction is not counted as a retry (so nothing escalates towards cooling the item down or dumping it out)
-     * and the BOT simply looks again in a minute. The warning repeats at most every ten minutes, so a long outage
-     * cannot flood the log or the Discord channel.
+     * <p>An out-of-stock chest is not the BOT's failure: the item keeps every bit of progress it has, nothing is
+     * counted as a retry (so nothing escalates towards cooling the item down or dumping it out) and nothing is dropped.
+     * The difference to the old behaviour is that the workflow is <b>not</b> parked for a minute: the empty container is
+     * remembered with a short recheck, the piece that needs it steps aside until then, and control goes straight back
+     * to the pickup branch, where every other chest, job and carried item still gets its turn. When nothing else is
+     * left the status line names exactly what is missing and when it will be looked at again.
      *
-     * <p>The status line is refreshed on <b>every</b> call, not only when the warning fires: the cycle that follows a
-     * wait rewrites the status ("Ready for next input"), and a throttled warning would then leave the operator looking
-     * at a bot that stands still with no visible reason for up to ten minutes.
+     * @param key  stable identity of the missing resource (book id+level, chest position, container role)
+     * @param what human readable description, phrased to follow "out of stock: ..."
+     * @return when this resource will be looked at again
      */
-    private void waitForSupply(String what) {
+    private long reportOutOfStock(String key, String what) {
+        return reportOutOfStock(key, what, null);
+    }
+
+    /**
+     * Same as {@link #reportOutOfStock(String, String)}, additionally parking every finished product of one job until
+     * the recheck. A full unload container refuses all of that job's products, so retrying them one by one would only
+     * reopen the same chest once per piece.
+     */
+    private long reportOutOfStock(String key, String what, AutoEnchantConfig.Enchant parkingJob) {
         long now = System.currentTimeMillis();
-        supplyWaitingFor = what;
-        module.setWorkflowStatus("Waiting for a restock: " + what);
-        if (!what.equals(supplyWarnedFor) || now - supplyWarnedAt > SUPPLY_WARN_INTERVAL_MS) {
-            supplyWarnedFor = what;
+        Stockout gap = stockouts.computeIfAbsent(key, k -> new Stockout());
+        gap.what = what;
+        gap.misses++;
+        gap.lastSeenAt = now;
+        gap.nextCheckAt = now + stockoutRecheckMs(gap.misses);
+        long wait = Math.max(1, (gap.nextCheckAt - now) / 1000);
+        // Only the piece that needs the missing thing steps aside, and only until the recheck: work the BOT can do
+        // right now is never held back by a chest a human still has to fill.
+        pauseForSupply(itemSnapshot, what, gap.nextCheckAt);
+        pauseJobProducts(parkingJob, gap.nextCheckAt);
+        trace("out of stock ({}): {} | recheck in {}s (miss {})", key, what, wait, gap.misses);
+        module.setWorkflowStatus("Out of stock: " + what + " - looking again in " + wait + "s; other work continues");
+        if (!key.equals(supplyWarnedFor) || now - supplyWarnedAt > SUPPLY_WARN_INTERVAL_MS) {
+            supplyWarnedFor = key;
             supplyWarnedAt = now;
-            module.warn("Auto-enchant is waiting for a restock of {}", what);
+            module.warn("Auto-enchant is out of stock: {}; the bot keeps cycling the pickup branch and looks again in {}s",
+                what, wait);
         }
-        pauseForSupply(itemSnapshot, what);
-        deadline = now + SUPPLY_RETRY_MS;
-        nextRetryAt = deadline;
-        closeContainer(State.BACKOFF);
+        // No long back-off: the interrupted transaction is dropped (the piece stays in the bag), the window is closed
+        // and the pickup branch runs again at once. That re-entry is what lets another job, another chest or another
+        // carried item continue while this container is empty.
+        clearTransaction();
+        deadline = gap.nextCheckAt;
+        nextRetryAt = gap.nextCheckAt;
+        state = State.ENTRYPOINT;
+        if (openContainerId() != 0) closeContainer(State.ENTRYPOINT);
+        return gap.nextCheckAt;
+    }
+
+    /** Doubling recheck of a container that keeps coming up empty, capped so a restocked chest is noticed quickly. */
+    private long stockoutRecheckMs(int misses) {
+        long base = Math.max(STOCKOUT_BASE_MS, AutoEnchantPlugin.PLUGIN_CONFIG.restartDelay * 50L);
+        return Math.min(STOCKOUT_MAX_MS, base << Math.max(0, Math.min(misses - 1, 5)));
+    }
+
+    /** True while this resource is still considered out of stock, i.e. its recheck is not due yet. */
+    private boolean isOutOfStock(String key) {
+        Stockout gap = stockouts.get(key);
+        return gap != null && System.currentTimeMillis() < gap.nextCheckAt;
+    }
+
+    /** Earliest time any known stockout may be looked at again, used as the poll interval of an idle workflow. */
+    private long nextStockoutCheckAt() {
+        long now = System.currentTimeMillis();
+        long earliest = now + STOCKOUT_MAX_MS;
+        for (Stockout gap : stockouts.values()) {
+            if (gap.nextCheckAt < earliest) earliest = gap.nextCheckAt;
+        }
+        return Math.max(now + 500L, earliest);
+    }
+
+    /**
+     * Forgets containers of one family once they delivered again, so the recheck interval starts over instead of
+     * carrying the doubling of an outage that is already over.
+     */
+    private void clearStockouts(String prefix) {
+        stockouts.keySet().removeIf(key -> key.startsWith(prefix));
     }
 
     /**
      * Parks one carried piece until the supply it needs is restocked, so the workflow can work on something else in
-     * the meantime. This is the per-item counterpart of the old "freeze everything for a minute": a missing
-     * {@code fire_aspect 2} only ever blocks the sword that needs it.
+     * the meantime. This is the per-item counterpart of a global freeze: a missing {@code fire_aspect 2} only ever
+     * blocks the sword that needs it.
      */
-    private void pauseForSupply(ItemStack stack, String what) {
+    private void pauseForSupply(ItemStack stack, String what, long until) {
         if (stack == null) return;
-        supplyPausedUntil.put(identityKey(stack), System.currentTimeMillis() + SUPPLY_RETRY_MS);
-        trace("pausing this enchantItem for {}s: waiting for {}", SUPPLY_RETRY_MS / 1000, what);
+        supplyPausedUntil.put(identityKey(stack), until);
+        trace("pausing this enchantItem for {}s: waiting for {}",
+            Math.max(1, (until - System.currentTimeMillis()) / 1000), what);
+    }
+
+    /** Parks every finished product of one job, so a full unload container cannot be retried piece after piece. */
+    private void pauseJobProducts(AutoEnchantConfig.Enchant job, long until) {
+        if (job == null) return;
+        for (int slot = 9; slot <= 44; slot++) {
+            ItemStack stack = playerItem(slot);
+            if (stack == null) continue;
+            if (module.runnableJobFor(stack).orElse(null) != job) continue;
+            if (!module.catalog().enchantments(stack).equals(targetEnchantsOf(job))) continue;
+            supplyPausedUntil.put(identityKey(stack), until);
+        }
     }
 
     private boolean isSupplyPaused(ItemStack stack) {
@@ -924,15 +1017,25 @@ final class EnchantWorkflowWorker {
         return blocked;
     }
 
-    /** Status text for "every carried piece is waiting for a restock", or null when work is available. */
+    /** Status line for an idle workflow; never null, so a blank status cannot hide why the BOT is waiting. */
+    private String idleStatus() {
+        String gap = supplyPauseSummary();
+        return gap != null ? gap : "Out of stock: waiting for a restock; checking again shortly";
+    }
+
+    /**
+     * Status text for "nothing can be done until a container is refilled", or null when work is available. Names the
+     * missing things (at most two, so the line stays readable) and how soon the next look is due.
+     */
     private String supplyPauseSummary() {
         long now = System.currentTimeMillis();
         supplyPausedUntil.entrySet().removeIf(entry -> entry.getValue() < now);
-        if (supplyPausedUntil.isEmpty()) return null;
-        long left = supplyPausedUntil.values().stream().mapToLong(Long::longValue).max().orElse(now) - now;
-        String what = supplyWaitingFor == null || supplyWaitingFor.isEmpty() ? "a book restock" : supplyWaitingFor;
-        return "Waiting for a restock of " + what + " before resuming " + supplyPausedUntil.size()
-            + " carried item(s); next check in " + Math.max(1, left / 1000) + "s";
+        stockouts.entrySet().removeIf(entry -> now - entry.getValue().lastSeenAt > STOCKOUT_EXPIRY_MS);
+        if (stockouts.isEmpty()) return null;
+        String missing = stockouts.values().stream().limit(2).map(gap -> gap.what)
+            .collect(java.util.stream.Collectors.joining("; "));
+        long wait = Math.max(1, (nextStockoutCheckAt() - now) / 1000);
+        return "Out of stock: " + missing + "; next check in " + wait + "s";
     }
 
     private void nextBook() {
@@ -987,9 +1090,10 @@ final class EnchantWorkflowWorker {
         }
         var chest = module.bookContainerPosition(book.id(), book.level());
         if (chest.isEmpty()) {
-            // A missing book marker is a supply problem, not a failed enchant: keep the item, tell the operator and
-            // look again in a minute instead of dumping a half-finished piece into the overflow container.
-            waitForSupply("a book chest bound to " + book.id() + " " + book.level());
+            // A missing book marker is a supply problem, not a failed enchant: the piece keeps its progress, the gap is
+            // named in the status/warning and the pickup branch keeps running for the other jobs.
+            reportOutOfStock("bookchest:" + book.id() + " " + book.level(),
+                book.id() + " " + book.level() + " (no book chest is bound to it)");
             return;
         }
         openingPosition = chest.get();
@@ -1003,12 +1107,13 @@ final class EnchantWorkflowWorker {
         int selected = findBookInTop(required);
         if (selected < 0) {
             trace("book chest {} holds no {} {}; the chest is out of stock", openingPosition, required.id(), required.level());
-            // Restock gap, not a failed enchant: the item keeps its progress, this piece steps aside and the chest is
-            // looked at again later. The chest position is part of the message so the operator knows which container
-            // to refill without digging through the marker scan.
-            waitForSupply(required.id() + " " + required.level() + " in the chest at " + openingPosition);
+            // The chest position is part of the message so the operator knows which container to refill, and part of the
+            // key so the same empty chest shares one recheck interval instead of one per book it should hold.
+            reportOutOfStock("book:" + required.id() + " " + required.level() + "@" + openingPosition,
+                required.id() + " " + required.level() + " in the chest at " + openingPosition);
             return;
         }
+        clearStockouts("book:");
         trace("book chest slot {} holds {} (want {} {})", selected,
             module.describeItem(openContainer().getItemStack(selected)), required.id(), required.level());
         sourceSlot = selected;
@@ -1464,8 +1569,11 @@ final class EnchantWorkflowWorker {
             return;
         }
         if (flushing) { flushBlocked("the output container is full"); return; }
-        // Full output container: never drop the enchantItem. It stays in the inventory and is retried later.
-        keepAndRetry("Output container is full");
+        // A full unload container is a supply problem, not a failed enchant: never drop the piece, never burn a
+        // transient retry on it. The job's finished products step aside until the container is emptied, the workflow
+        // keeps cycling and the status line says which container is full.
+        reportOutOfStock("store:" + target.displayName(),
+            "an unload container for job " + target.displayName() + " (the container is full)", target);
     }
 
     /** Target slots that still hold a depositable stack; slots are stable while the window stays open. */
@@ -1492,7 +1600,11 @@ final class EnchantWorkflowWorker {
                 return;
             }
         }
-        waitForRoom("an unload container that accepts the finished product (" + reason + ")");
+        // No container takes the piece. The finished products of this job step aside together (a full chest would
+        // otherwise be retried once per product) and the workflow keeps cycling, so another job can still work while
+        // somebody empties the chest.
+        reportOutOfStock("store:" + target.displayName(),
+            "an unload container for job " + target.displayName() + " (" + reason + ")", target);
     }
 
     private void dropCurrentItem() {
@@ -1548,15 +1660,16 @@ final class EnchantWorkflowWorker {
         }
         if (output.isEmpty()) {
             if (flushing) {
-                // Nothing can take the piece: say so and wait for a human instead of retrying the same open forever.
-                waitForRoom("an unload container for job " + target.displayName() + " (no output or overflow container is bound)");
+                // Nothing can take the piece: report it, park the finished products of this job and keep cycling.
+                reportOutOfStock("store:" + target.displayName(),
+                    "an unload container for job " + target.displayName()
+                        + " (no output or overflow container is bound)", target);
                 return;
             }
-            // Keep the enchantItem in the BOT inventory instead of dropping it; the next cycle resumes it.
-            module.setWorkflowStatus("No " + role + " container available; keeping the enchantItem in inventory");
-            failureReason = null;
-            state = State.BACKOFF;
-            deadline = System.currentTimeMillis() + Math.max(0, AutoEnchantPlugin.PLUGIN_CONFIG.restartDelay) * 50L;
+            // Keep the enchantItem in the BOT inventory instead of dropping it; the next cycle resumes it once the
+            // unload container exists again.
+            reportOutOfStock("store:" + target.displayName() + ":" + role,
+                "an unload container for job " + target.displayName() + " (no " + role + " container is bound)", target);
             return;
         }
         openingPosition = output.get();
@@ -1736,11 +1849,33 @@ final class EnchantWorkflowWorker {
                 flushBlocked("could not open " + openingPosition + ": " + reason);
                 return;
             }
+            if (isStoreState(openState)) {
+                // The unload chest itself is gone: that is a stockout of the container, not a broken step, so it is
+                // reported and the workflow keeps cycling for the other jobs instead of burning retries on it.
+                reportOutOfStock("store:" + (target == null ? "?" : target.displayName()),
+                    "an unload container for job " + (target == null ? "?" : target.displayName())
+                        + " (could not open " + openingPosition + ": " + reason + ")", target);
+                return;
+            }
             keepAndRetry("Could not open " + openingPosition + " after " + MAX_OPEN_ATTEMPTS + " attempts: " + reason);
             return;
         }
         module.setWorkflowStatus("Reopening " + openingPosition + ": " + reason);
         if (openContainerId() != 0) closeContainer(openState); else state = openState;
+    }
+
+    /**
+     * True when the state is part of the unload trip, i.e. the window being opened is the container a finished product
+     * is meant to go into. A container that will not open there is out of stock, not a broken step.
+     */
+    private boolean isStoreState(State state) {
+        return switch (state) {
+            case STORE_GO_TO_CHEST, STORE_AWAIT_INTERACT, STORE_DEPOSIT, STORE_AWAIT_DEPOSIT,
+                 POST_ENCHANT_INPUT_GO_TO, POST_ENCHANT_INPUT_AWAIT_INTERACT, POST_ENCHANT_INPUT_DEPOSIT,
+                 POST_ENCHANT_INPUT_AWAIT_DEPOSIT, POST_ENCHANT_OVERFLOW_GO_TO, POST_ENCHANT_OVERFLOW_AWAIT_INTERACT,
+                 POST_ENCHANT_OVERFLOW_DEPOSIT, POST_ENCHANT_OVERFLOW_AWAIT_DEPOSIT -> true;
+            default -> false;
+        };
     }
 
     /**
@@ -1806,9 +1941,9 @@ final class EnchantWorkflowWorker {
         if (countStacks(ItemRegistry.ANVIL) >= restockStacks()) { state = State.CLOSE_SUPPLY; return; }
         int slot = findAnvilInTop();
         if (slot < 0) {
-            // Same rule as an empty book chest: a supply gap is a wait, not a failed enchant and not a reason to
-            // park the piece. The station simply stays without an anvil until somebody restocks the barrel.
-            waitForSupply("an anvil in the anvil supply container");
+            // Same rule as an empty book chest: an empty barrel is a supply gap that is reported and revisited, not a
+            // failed enchant and not a reason to park the piece.
+            reportOutOfStock("anvil_supply@" + openingPosition, "an anvil in the anvil supply container at " + openingPosition);
             return;
         }
         submit(new ShiftClick(openContainerId(), slot, ShiftClickItemAction.LEFT_CLICK), State.RESTOCK_ANVIL_AWAIT_WITHDRAW);
@@ -2193,6 +2328,9 @@ final class EnchantWorkflowWorker {
         for (int slot = 9; slot <= 44; slot++) {
             ItemStack stack = playerItem(slot);
             if (stack == null) continue;
+            // A product whose unload container is out of stock was parked: retrying it before its recheck would only
+            // reopen the same full chest and, worse, do it once per carried product.
+            if (isSupplyPaused(stack)) continue;
             var job = module.runnableJobFor(stack);
             if (job.isEmpty()) continue;
             Map<String, Integer> wanted = targetEnchantsOf(job.get());
@@ -2212,19 +2350,6 @@ final class EnchantWorkflowWorker {
             });
         }
         return wanted;
-    }
-
-    /**
-     * Waits for a human to fix the thing that blocks the bag: no free slot with nothing left to unload, or an unload
-     * container that will not take the finished piece. Like a missing book this is a supply problem, so it is warned
-     * about (throttled), never counted as a retry and never a reason to drop an item.
-     *
-     * @param what the missing thing, phrased to follow "waiting for a restock of ..."
-     */
-    private void waitForRoom(String what) {
-        flushing = false;
-        flushOverflow = false;
-        waitForSupply(what);
     }
 
     /** True when both inputs of the next planned merge are already carried, so the anvil can be used right away. */
@@ -2433,5 +2558,16 @@ final class EnchantWorkflowWorker {
             if (preset != null) return preset.targetPlaceholder();
         }
         return EnchantPresetCatalog.shortId(target.item);
+    }
+
+    /**
+     * One container that came up empty: what it was supposed to hold, when it was last seen empty, when it may be
+     * looked at again and how many times in a row it has been empty (which drives the growing recheck interval).
+     */
+    private static final class Stockout {
+        private String what = "";
+        private long lastSeenAt;
+        private long nextCheckAt;
+        private int misses;
     }
 }
