@@ -91,6 +91,8 @@ final class EnchantWorkflowWorker {
     /** What the BOT is currently waiting on at a supply chest, so the same restock warning is not repeated. */
     private String supplyWarnedFor = "";
     private long supplyWarnedAt;
+    /** What the BOT is waiting for right now, kept for the status line of the wait itself. */
+    private String supplyWaitingFor = "";
     /** How often a supply gap is looked at again, and how often the same warning may be repeated. */
     private static final long SUPPLY_RETRY_MS = 60_000L;
     private static final long SUPPLY_WARN_INTERVAL_MS = 600_000L;
@@ -120,6 +122,14 @@ final class EnchantWorkflowWorker {
     private static final int MAX_DEPOSIT_RETRIES = 2;
     /** Set once a close click was re-sent for the same window, so a lost echo is re-asked once, not forever. */
     private boolean closeResent;
+    /**
+     * Carried enchantItems paused by a supply gap (an empty book chest, a missing book marker), keyed like
+     * {@code skipUntil}. The pause is per item on purpose: a missing book blocks the one piece that needs it, not the
+     * whole workflow, so another job's carried item still gets its turn while a human restocks the chest.
+     */
+    private final Map<String, Long> supplyPausedUntil = new HashMap<>();
+    /** Signature of the last dumped plan, so a minute-long supply gap does not re-print the same tree every retry. */
+    private String lastPlanSignature = "";
     /** Position in the pickup-chest rotation, so an empty chest is skipped instead of retried forever. */
     private int inputCursor;
     /** Consecutive empty pickup chests; a full empty round backs off instead of re-opening them nonstop. */
@@ -315,6 +325,19 @@ final class EnchantWorkflowWorker {
         // as-is and never reset, so work the BOT already paid for is kept.
         int carried = findCarriedEquipment();
         if (carried >= 0) { adoptCarried(carried); return; }
+        // Nothing to resume because every carried piece is waiting for a restock: fetching a fresh item now would only
+        // put a second half-finished piece in the bag while the first one still waits for the same book. Only jobs with
+        // a supply gap are held back though - a second job that is not waiting for anything keeps working.
+        var supplyBlocked = supplyBlockedJobs();
+        List<AutoEnchantConfig.Enchant> fetchable = supplyBlocked.isEmpty() ? runnable
+            : runnable.stream().filter(job -> !supplyBlocked.contains(job)).toList();
+        if (fetchable.isEmpty()) {
+            String gap = supplyPauseSummary();
+            module.setWorkflowStatus(gap != null ? gap : "Waiting for a restock before the next enchantItem");
+            state = State.AWAIT_RESTOCK;
+            deadline = System.currentTimeMillis() + 1_000L;
+            return;
+        }
         // Nothing of ours to resume, but the bag is too full to fetch another piece: unload finished products that are
         // still waiting in the inventory (the output container was full or its marker was missing at the time) so the
         // next cycle has room again. A full bag used to dead-end here: the withdraw click silently did nothing and the
@@ -337,7 +360,7 @@ final class EnchantWorkflowWorker {
             deadline = System.currentTimeMillis() + Math.max(500L, AutoEnchantPlugin.PLUGIN_CONFIG.restartDelay * 50L);
             return;
         }
-        List<BlockPos> chests = inputChests(runnable);
+        List<BlockPos> chests = inputChests(fetchable);
         if (chests.isEmpty()) {
             module.setWorkflowStatus("Enabled jobs have no reachable input chest");
             state = State.AWAIT_RESTOCK;
@@ -379,6 +402,9 @@ final class EnchantWorkflowWorker {
             if (stack == null) continue;
             if (module.runnableJobFor(stack).isEmpty()) continue;
             if (isCoolingDown(stack)) continue;
+            // A piece waiting for a book that is out of stock steps aside for other carried pieces instead of
+            // monopolising the loop; it comes back in by itself once the pause runs out.
+            if (isSupplyPaused(stack)) continue;
             int score = progressScore(stack);
             if (score > bestScore) { bestScore = score; bestSlot = slot; }
         }
@@ -505,10 +531,15 @@ final class EnchantWorkflowWorker {
         int selected = -1;
         ItemStack chosen = null;
         AutoEnchantConfig.Enchant chosenTarget = null;
+        // A job whose carried piece waits for a book is skipped: fetching another piece of it would just stack up
+        // half-finished items behind the same empty chest.
+        var supplyBlocked = supplyBlockedJobs();
         for (int slot = 0; slot < top; slot++) {
             ItemStack stack = openContainer().getItemStack(slot);
             Optional<AutoEnchantConfig.Enchant> match = module.runnableJobFor(stack);
-            if (match.isPresent()) { selected = slot; chosen = stack; chosenTarget = match.get(); break; }
+            if (match.isEmpty() || supplyBlocked.contains(match.get())) continue;
+            selected = slot; chosen = stack; chosenTarget = match.get();
+            break;
         }
         if (selected < 0) {
             // Nothing this chest can serve: move the rotation on so the other jobs keep getting a turn.
@@ -838,18 +869,70 @@ final class EnchantWorkflowWorker {
      * the transaction is not counted as a retry (so nothing escalates towards cooling the item down or dumping it out)
      * and the BOT simply looks again in a minute. The warning repeats at most every ten minutes, so a long outage
      * cannot flood the log or the Discord channel.
+     *
+     * <p>The status line is refreshed on <b>every</b> call, not only when the warning fires: the cycle that follows a
+     * wait rewrites the status ("Ready for next input"), and a throttled warning would then leave the operator looking
+     * at a bot that stands still with no visible reason for up to ten minutes.
      */
     private void waitForSupply(String what) {
         long now = System.currentTimeMillis();
+        supplyWaitingFor = what;
+        module.setWorkflowStatus("Waiting for a restock: " + what);
         if (!what.equals(supplyWarnedFor) || now - supplyWarnedAt > SUPPLY_WARN_INTERVAL_MS) {
             supplyWarnedFor = what;
             supplyWarnedAt = now;
-            module.setWorkflowStatus("Waiting for a restock: " + what);
             module.warn("Auto-enchant is waiting for a restock of {}", what);
         }
+        pauseForSupply(itemSnapshot, what);
         deadline = now + SUPPLY_RETRY_MS;
         nextRetryAt = deadline;
         closeContainer(State.BACKOFF);
+    }
+
+    /**
+     * Parks one carried piece until the supply it needs is restocked, so the workflow can work on something else in
+     * the meantime. This is the per-item counterpart of the old "freeze everything for a minute": a missing
+     * {@code fire_aspect 2} only ever blocks the sword that needs it.
+     */
+    private void pauseForSupply(ItemStack stack, String what) {
+        if (stack == null) return;
+        supplyPausedUntil.put(identityKey(stack), System.currentTimeMillis() + SUPPLY_RETRY_MS);
+        trace("pausing this enchantItem for {}s: waiting for {}", SUPPLY_RETRY_MS / 1000, what);
+    }
+
+    private boolean isSupplyPaused(ItemStack stack) {
+        if (stack == null) return false;
+        Long until = supplyPausedUntil.get(identityKey(stack));
+        return until != null && System.currentTimeMillis() < until;
+    }
+
+    /**
+     * Jobs that currently hold a carried piece paused by a supply gap. Their pickup chest stays out of the rotation and
+     * their items are not adopted from a shared chest, so a missing book costs exactly one item's progress.
+     */
+    private java.util.Set<AutoEnchantConfig.Enchant> supplyBlockedJobs() {
+        java.util.Set<AutoEnchantConfig.Enchant> blocked =
+            java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        long now = System.currentTimeMillis();
+        for (int slot = 9; slot <= 44; slot++) {
+            ItemStack stack = playerItem(slot);
+            if (stack == null) continue;
+            Long until = supplyPausedUntil.get(identityKey(stack));
+            if (until == null || until < now) continue;
+            module.runnableJobFor(stack).ifPresent(blocked::add);
+        }
+        return blocked;
+    }
+
+    /** Status text for "every carried piece is waiting for a restock", or null when work is available. */
+    private String supplyPauseSummary() {
+        long now = System.currentTimeMillis();
+        supplyPausedUntil.entrySet().removeIf(entry -> entry.getValue() < now);
+        if (supplyPausedUntil.isEmpty()) return null;
+        long left = supplyPausedUntil.values().stream().mapToLong(Long::longValue).max().orElse(now) - now;
+        String what = supplyWaitingFor == null || supplyWaitingFor.isEmpty() ? "a book restock" : supplyWaitingFor;
+        return "Waiting for a restock of " + what + " before resuming " + supplyPausedUntil.size()
+            + " carried item(s); next check in " + Math.max(1, left / 1000) + "s";
     }
 
     private void nextBook() {
@@ -919,8 +1002,11 @@ final class EnchantWorkflowWorker {
         EnchantPresetCatalog.Enchant required = books.get(bookIndex);
         int selected = findBookInTop(required);
         if (selected < 0) {
-            // Restock gap, not a failed enchant: the item keeps its progress and the chest is looked at again later.
-            waitForSupply(required.id() + " " + required.level() + " in the bound chest");
+            trace("book chest {} holds no {} {}; the chest is out of stock", openingPosition, required.id(), required.level());
+            // Restock gap, not a failed enchant: the item keeps its progress, this piece steps aside and the chest is
+            // looked at again later. The chest position is part of the message so the operator knows which container
+            // to refill without digging through the marker scan.
+            waitForSupply(required.id() + " " + required.level() + " in the chest at " + openingPosition);
             return;
         }
         trace("book chest slot {} holds {} (want {} {})", selected,
@@ -1864,8 +1950,12 @@ final class EnchantWorkflowWorker {
         }
         long now = System.currentTimeMillis();
         skipUntil.entrySet().removeIf(entry -> entry.getValue() < now);
+        supplyPausedUntil.entrySet().removeIf(entry -> entry.getValue() < now);
         state = State.NEXT_ENCHANT;
-        module.setWorkflowStatus("Ready for next input enchantItem");
+        // Never print "ready" while every carried piece is waiting for a restock: that line is what made a supply gap
+        // look like a frozen bot.
+        String supplyGap = supplyPauseSummary();
+        module.setWorkflowStatus(supplyGap != null ? supplyGap : "Ready for next input enchantItem");
     }
 
     /**
@@ -2287,6 +2377,15 @@ final class EnchantWorkflowWorker {
 
     /** Full plan dump: the tree the preset (or planner) produced and every merge it will perform. */
     private void tracePlan() {
+        // A retry after a supply gap rebuilds the same plan: print the full tree once, then a single line, so an
+        // hour-long missing book does not bury the log under identical dumps.
+        String signature = activePreset + "|" + operations.hashCode() + "|" + books + "|"
+            + describeEnchants(targetEnchants) + "|" + desiredRename();
+        if (signature.equals(lastPlanSignature)) {
+            trace("plan unchanged: {} book(s), {} merge(s)", books.size(), operations.size());
+            return;
+        }
+        lastPlanSignature = signature;
         trace("plan preset={} books={} merges={} target={}", activePreset == null ? "custom" : activePreset,
             books.size(), operations.size(), describeEnchants(targetEnchants));
         for (int i = 0; i < operations.size(); i++) {
