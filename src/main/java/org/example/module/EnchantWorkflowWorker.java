@@ -104,8 +104,22 @@ final class EnchantWorkflowWorker {
     private boolean flushing;
     /** Set once a flush fell back to the overflow container because the output container would not take the piece. */
     private boolean flushOverflow;
-    /** Free player slots a transaction needs: the equipment piece itself, one book, and the anvil result. */
+    /** Free player slots a transaction wants: the equipment piece itself, one book, and the anvil result. */
     private static final int FREE_SLOTS_FOR_TRANSACTION = 3;
+    /**
+     * Consecutive unload trips that did not free enough bag space. Borrowed from the trader's
+     * {@code storeTripAttempts}: a bag that stays full after a few trips must not turn into an endless
+     * open-close-open loop - the workflow warns once and continues with whatever room it has.
+     */
+    private int flushTrips;
+    private static final int MAX_FLUSH_TRIPS = 4;
+    /** Player slots the deposit click was built for; verification waits until every one of them is empty. */
+    private List<Integer> depositSlots = List.of();
+    /** Re-clicks of a deposit the chest only partly accepted, inside the same window (the trader allows two). */
+    private int depositRetries;
+    private static final int MAX_DEPOSIT_RETRIES = 2;
+    /** Set once a close click was re-sent for the same window, so a lost echo is re-asked once, not forever. */
+    private boolean closeResent;
     /** Position in the pickup-chest rotation, so an empty chest is skipped instead of retried forever. */
     private int inputCursor;
     /** Consecutive empty pickup chests; a full empty round backs off instead of re-opening them nonstop. */
@@ -266,9 +280,7 @@ final class EnchantWorkflowWorker {
                 case CLOSE_OUTPUT -> closeOutput();
                 case DROP_ITEM -> dropCurrentItem();
                 case BACKOFF -> { if (System.currentTimeMillis() >= Math.max(deadline, nextRetryAt)) state = State.READY_NEXT_ENCHANT; }
-                case WAIT_CLOSE -> {
-                    if (openContainerId() == 0 || System.currentTimeMillis() > deadline) state = afterCloseState;
-                }
+                case WAIT_CLOSE -> waitForClose();
                 case POST_ENCHANT -> beginOutput();
                 case CHECK_ANVIL -> checkAnvil();
                 case RESTOCK_ANVIL_WITHDRAW -> handleSupplyWindow();
@@ -303,18 +315,22 @@ final class EnchantWorkflowWorker {
         // as-is and never reset, so work the BOT already paid for is kept.
         int carried = findCarriedEquipment();
         if (carried >= 0) { adoptCarried(carried); return; }
-        // Nothing of ours to resume, but the bag is too full to fetch another piece: unload a finished product that is
+        // Nothing of ours to resume, but the bag is too full to fetch another piece: unload finished products that are
         // still waiting in the inventory (the output container was full or its marker was missing at the time) so the
         // next cycle has room again. A full bag used to dead-end here: the withdraw click silently did nothing and the
         // piece was retried forever, because the only unload path was the end of a successful transaction.
+        //
+        // Same split as the trader's EVAL_STORE: no free slot at all is a hard stop, while a bag that is merely
+        // comfortable-but-tight is worked with instead of stalled, so a single free slot never blocks the queue.
         int freeSlots = freeInventorySlots();
-        if (freeSlots < FREE_SLOTS_FOR_TRANSACTION) {
-            if (flushFinishedProduct("only " + freeSlots + " free slot(s) left")) return;
+        if (freeSlots < 1) {
+            if (flushFinishedProduct("no free slot left in the bag")) return;
             // Nothing unloadable is left in the bag: opening the input chest would only have the withdraw click bounce
             // off a full inventory. Say so once and look again in a minute instead of spinning on the chest.
             waitForRoom("free space in the BOT inventory (the bag is full and no finished product is left to unload)");
             return;
         }
+        if (freeSlots < FREE_SLOTS_FOR_TRANSACTION && flushFinishedProduct("only " + freeSlots + " free slot(s) left")) return;
         if (module.stations().getOrDefault("anvil", List.of()).isEmpty()) {
             module.setWorkflowStatus("Waiting for a loaded anvil");
             state = State.AWAIT_RESTOCK;
@@ -1272,37 +1288,105 @@ final class EnchantWorkflowWorker {
         };
     }
 
+    /**
+     * Unloads into the open chest, modelled on the trader's store trip: every stack that belongs in this chest goes in
+     * one window with one click queue.
+     *
+     * <p>A normal transaction stores exactly its own enchantItem. A flush trip - the trip that exists only to free bag
+     * space - stores every finished piece of that job at once, so a bag with ten finished swords needs one chest trip
+     * instead of ten. The deposit clicks run at one per tick (not the configured action delay), because a queue of
+     * twenty shift clicks at five ticks each would be five seconds of standing at the chest.
+     */
     private void unloadItem() {
-        playerSlot = findCurrentEquipment();
-        if (playerSlot < 0) { trace("nothing to deposit: the enchantItem is already out of the inventory"); state = State.CLOSE_OUTPUT; return; }
-        Map<String, Integer> carried = shortIds(module.catalog().enchantments(playerItem(playerSlot)));
-        trace("depositing slot {} {} | enchants={} target={} complete={}", playerSlot,
-            module.describeItem(playerItem(playerSlot)), describeEnchants(carried),
-            describeEnchants(targetEnchants), carried.equals(targetEnchants));
-        State await = switch (state) {
-            case POST_ENCHANT_INPUT_DEPOSIT -> State.POST_ENCHANT_INPUT_AWAIT_DEPOSIT;
-            case POST_ENCHANT_OVERFLOW_DEPOSIT -> State.POST_ENCHANT_OVERFLOW_AWAIT_DEPOSIT;
-            default -> State.STORE_AWAIT_DEPOSIT;
-        };
-        submit(new ShiftClick(openContainerId(), inventoryContainerSlot(playerSlot, topSlots()), ShiftClickItemAction.LEFT_CLICK), await);
-    }
-
-    private void verifyUnloaded() {
-        // The deposited slot itself is the strongest signal: equipment stacks are single items, so a shift-click into
-        // the chest empties exactly that slot. Scanning by identity alone confuses several identical finished products
-        // in the bag - it would find the next copy and report "not deposited" while the first one already left.
-        boolean slotCleared = playerSlot >= 9 && playerItem(playerSlot) == null;
-        if (slotCleared || findCurrentEquipment() < 0) {
-            outputStored = true;
-            trace("deposit confirmed: the enchantItem left the inventory");
+        List<Integer> slots = depositTargets();
+        if (slots.isEmpty()) {
+            trace("nothing to deposit: no matching stack is left in the inventory");
             state = State.CLOSE_OUTPUT;
             return;
         }
-        if (System.currentTimeMillis() > deadline) {
-            if (flushing) { flushBlocked("the output container is full"); return; }
-            // Full output container: never drop the enchantItem. It stays in the inventory and is retried later.
-            keepAndRetry("Output container is full");
+        depositSlots = slots;
+        depositRetries = 0;
+        playerSlot = slots.getFirst();
+        trace("depositing {} stack(s) in one window: {} | target={}", slots.size(),
+            slots.stream().map(slot -> slot + "=" + module.describeItem(playerItem(slot)))
+                .collect(java.util.stream.Collectors.joining(", ")),
+            describeEnchants(targetEnchants));
+        submitDeposit(slots);
+    }
+
+    /** Sends one shift-click per target slot and waits for every one of them to be empty. */
+    private void submitDeposit(List<Integer> slots) {
+        List<com.zenith.feature.inventory.actions.InventoryAction> actions = new ArrayList<>();
+        for (int slot : slots) {
+            actions.add(new ShiftClick(openContainerId(), inventoryContainerSlot(slot, topSlots()),
+                ShiftClickItemAction.LEFT_CLICK));
         }
+        // Covers both the first click and a re-click from the await state: a deposit retry must land back in the same
+        // await state, otherwise it would return to the deposit state, rebuild the list and click the same stacks again.
+        State await = switch (state) {
+            case POST_ENCHANT_INPUT_DEPOSIT, POST_ENCHANT_INPUT_AWAIT_DEPOSIT -> State.POST_ENCHANT_INPUT_AWAIT_DEPOSIT;
+            case POST_ENCHANT_OVERFLOW_DEPOSIT, POST_ENCHANT_OVERFLOW_AWAIT_DEPOSIT -> State.POST_ENCHANT_OVERFLOW_AWAIT_DEPOSIT;
+            default -> State.STORE_AWAIT_DEPOSIT;
+        };
+        submitBurst(actions, await);
+    }
+
+    /**
+     * Slots this window should store.
+     *
+     * <p>The transaction item is picked by identity; a flush trip takes every carried stack of the same item whose
+     * enchantment set already equals the job's target, which also covers pieces that were renamed by an earlier pass.
+     */
+    private List<Integer> depositTargets() {
+        List<Integer> slots = new ArrayList<>();
+        if (!flushing) {
+            playerSlot = findCurrentEquipment();
+            if (playerSlot >= 0) slots.add(playerSlot);
+            return slots;
+        }
+        for (int slot = 9; slot <= 44; slot++) if (isDepositTarget(playerItem(slot))) slots.add(slot);
+        return slots;
+    }
+
+    /** True when this stack is what a flush trip wants to store: the job's item, already at its target set. */
+    private boolean isDepositTarget(ItemStack stack) {
+        if (stack == null || itemSnapshot == null) return false;
+        if (stack.getId() != itemSnapshot.getId()) return false;
+        if (!flushing) return sameStackIdentity(itemSnapshot, stack);
+        // The same job, not merely the same item: two jobs can share an item type (and even a target set) while
+        // pointing at different output chests, and a batch must never file one job's products into the other's chest.
+        if (module.runnableJobFor(stack).orElse(null) != target) return false;
+        return module.catalog().enchantments(stack).equals(targetEnchants);
+    }
+
+    private void verifyUnloaded() {
+        List<Integer> remaining = remainingDepositSlots();
+        if (remaining.isEmpty()) {
+            outputStored = true;
+            trace("deposit confirmed: {} stack(s) left the inventory", depositSlots.size());
+            state = State.CLOSE_OUTPUT;
+            return;
+        }
+        if (System.currentTimeMillis() <= deadline) return;
+        // The chest took only part of the trip (a slot filled between the click and the deposit): re-collect what is
+        // still carried and click it again in the same window, exactly like the trader's store retry.
+        if (depositRetries < MAX_DEPOSIT_RETRIES) {
+            depositRetries++;
+            trace("chest did not take every stack; depositing the remaining {} again ({}/{})",
+                remaining.size(), depositRetries, MAX_DEPOSIT_RETRIES);
+            submitDeposit(remaining);
+            return;
+        }
+        if (flushing) { flushBlocked("the output container is full"); return; }
+        // Full output container: never drop the enchantItem. It stays in the inventory and is retried later.
+        keepAndRetry("Output container is full");
+    }
+
+    /** Target slots that still hold a depositable stack; slots are stable while the window stays open. */
+    private List<Integer> remainingDepositSlots() {
+        List<Integer> left = new ArrayList<>();
+        for (int slot : depositSlots) if (isDepositTarget(playerItem(slot))) left.add(slot);
+        return left;
     }
 
     /**
@@ -1514,7 +1598,30 @@ final class EnchantWorkflowWorker {
         if (id == 0) { state = next; return; }
         activeContainerId = id;
         afterCloseState = next;
+        closeResent = false;
         submit(new CloseContainer(id), State.WAIT_CLOSE);
+    }
+
+    /**
+     * Waits for the close to be echoed back, the way the trader's {@code awaitContainerClosed} does.
+     *
+     * <p>The inventory cache (id 0) stays frozen until the server confirms the close, so any state entered on the
+     * plain timeout reads a stale bag. A lost close click therefore earns one re-send instead of a blind jump into the
+     * next state; only a second timeout gives up and continues.
+     */
+    private void waitForClose() {
+        int id = openContainerId();
+        if (id == 0) { closeResent = false; state = afterCloseState; return; }
+        if (System.currentTimeMillis() < deadline) return;
+        if (!closeResent) {
+            closeResent = true;
+            trace("window {} is still open; sending the close again", id);
+            submit(new CloseContainer(id), State.WAIT_CLOSE);
+            return;
+        }
+        closeResent = false;
+        trace("window {} refused to close; continuing anyway", id);
+        state = afterCloseState;
     }
 
     /**
@@ -1718,6 +1825,21 @@ final class EnchantWorkflowWorker {
         if (inventoryFuture == RequestFuture.rejected) { inventoryFuture = null; fail("Inventory action queue is busy"); }
     }
 
+    /**
+     * Submits a single burst of clicks at one click per tick, the way the trader's deposit queue does.
+     *
+     * <p>The configured action delay exists so a human does not see machine-gun clicking; inside one window a run of
+     * shift clicks is exactly what a player does, and paying 5 ticks per stack turns a full bag into seconds of
+     * standing still. The budget grows with the queue, so a long trip is not mistaken for a failed one.
+     */
+    private void submitBurst(List<com.zenith.feature.inventory.actions.InventoryAction> actions, State after) {
+        inventoryFuture = INVENTORY.submit(InventoryActionRequest.builder()
+            .owner(this).priority(actionPriority()).actionDelayTicks(1).actions(actions).build());
+        afterInventoryState = after;
+        deadline = System.currentTimeMillis() + awaitIntactMs() + actions.size() * 100L;
+        if (inventoryFuture == RequestFuture.rejected) { inventoryFuture = null; fail("Inventory action queue is busy"); }
+    }
+
     private void reset() {
         // Attempt counters survive a failed round so a repeatedly failing enchantItem eventually gets parked. A round
         // only counts as a success once the item really left the inventory: a parked retry is not a success, otherwise
@@ -1735,6 +1857,7 @@ final class EnchantWorkflowWorker {
         if (succeeded) {
             itemAttempts.clear();
             transientRetries = 0;
+            flushTrips = 0;
             // Round-robin: the next enchantItem is fetched from the next job's pickup chest, so one busy chest cannot
             // starve every other enchantItem.
             inputCursor++;
@@ -1811,6 +1934,9 @@ final class EnchantWorkflowWorker {
         outputStored = false;
         flushing = false;
         flushOverflow = false;
+        depositSlots = List.of();
+        depositRetries = 0;
+        closeResent = false;
         // The transient-retry counter is NOT cleared here: it has to survive a parked round, otherwise a step that
         // fails on every attempt would spin forever instead of parking the item (reset() clears it on success).
         takeAttempts = 0;
@@ -1930,6 +2056,14 @@ final class EnchantWorkflowWorker {
     private boolean flushFinishedProduct(String reason) {
         int slot = findFinishedProduct();
         if (slot < 0) return false;
+        if (flushTrips >= MAX_FLUSH_TRIPS) {
+            // The trader's storeTripAttempts cap: after a few trips that freed nothing the bag is not going to get
+            // roomier by itself, so stop opening the chest and carry on with the slots that are left.
+            flushTrips = 0;
+            module.warn("Auto-enchant unloaded {} times without freeing enough bag space ({} free); continuing",
+                MAX_FLUSH_TRIPS, freeInventorySlots());
+            return false;
+        }
         ItemStack stack = playerItem(slot);
         var job = module.runnableJobFor(stack);
         if (job.isEmpty()) return false;
@@ -1950,6 +2084,9 @@ final class EnchantWorkflowWorker {
         outputStored = false;
         flushing = true;
         flushOverflow = false;
+        flushTrips++;
+        depositSlots = List.of();
+        depositRetries = 0;
         // A flush is worth starting right away: it must not inherit the back-off of the step that ran out of space.
         nextRetryAt = 0;
         transactionStartedAt = System.currentTimeMillis();
@@ -2146,13 +2283,6 @@ final class EnchantWorkflowWorker {
             out.append(EnchantPresetCatalog.shortId(id)).append(' ').append(level);
         });
         return out.append('}').toString();
-    }
-
-    /** Rewrites a registry-id keyed enchantment map into short ids, the form the planner and config use. */
-    private Map<String, Integer> shortIds(Map<String, Integer> enchants) {
-        Map<String, Integer> out = new LinkedHashMap<>();
-        if (enchants != null) enchants.forEach((id, level) -> out.put(EnchantPresetCatalog.shortId(id), level));
-        return out;
     }
 
     /** Full plan dump: the tree the preset (or planner) produced and every merge it will perform. */
