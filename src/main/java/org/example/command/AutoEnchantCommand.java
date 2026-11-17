@@ -1,7 +1,5 @@
 package org.example.command;
 
-import com.mojang.brigadier.arguments.IntegerArgumentType;
-import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.zenith.Proxy;
 import com.zenith.command.api.Command;
@@ -9,11 +7,8 @@ import com.zenith.command.api.CommandCategory;
 import com.zenith.command.api.CommandContext;
 import com.zenith.command.api.CommandUsage;
 import com.zenith.command.brigadier.CustomStringArgumentType;
-import com.zenith.discord.Embed;
 import com.zenith.feature.player.World;
-import com.zenith.mc.block.BlockPos;
 import org.example.AutoEnchantConfig;
-import org.example.EnchantPresetCatalog;
 import org.example.module.AutoEnchantModule;
 
 import java.util.List;
@@ -48,8 +43,16 @@ public class AutoEnchantCommand extends Command {
                 "list",
                 "set help",
                 "waitForInteractTimeout <ticks>",
+                "actionDelay <ticks>",
+                "restartDelay <ticks>",
+                "experienceSource <none/kill/exp>",
                 "logTradeStatusToDiscord on/off",
-                "killSpot <x> <y> <z>",
+                "renameOnly on/off",
+                "ExpFarmSpot <x> <y> <z>",
+                "anvil <x> <y> <z>",
+                "anvilChest <x> <y> <z>",
+                "xpBurst <ticks>",
+                "xpAccumulate <levels>",
                 "scan",
                 "scanRange <horizontal> <vertical>",
                 "anvilRestock <stacks>"
@@ -83,7 +86,7 @@ public class AutoEnchantCommand extends Command {
                                 .addField("Block At Output Pos", storeChestBlock.name());
                         }
                         var enchant = new AutoEnchantConfig.Enchant();
-                        enchant.item = EnchantPresetCatalog.shortId(enchantItem);
+                        enchant.item = AutoEnchantConfig.shortId(enchantItem);
                         enchant.inputItemChest = inputItemPos;
                         enchant.outputChest = storeChestPos;
                         inEventLoop(() -> {
@@ -147,7 +150,7 @@ public class AutoEnchantCommand extends Command {
                         }
                         var enchant = PLUGIN_CONFIG.enchants.get(id);
                         var enchantItem = getString(c, "enchantItem");
-                        enchant.item = EnchantPresetCatalog.shortId(enchantItem);
+                        enchant.item = AutoEnchantConfig.shortId(enchantItem);
                         inEventLoop(() -> MODULE.get(AutoEnchantModule.class).onTradeListChange());
                         c.getSource().getEmbed()
                             .title("Enchant Item Set")
@@ -275,7 +278,7 @@ public class AutoEnchantCommand extends Command {
                             var enchant = PLUGIN_CONFIG.enchants.get(id);
                             var enchantment = getEnchantment(c, "enchant");
                             var level = getInteger(c, "level");
-                            enchant.itemEnchantments.put(EnchantPresetCatalog.shortId(enchantment.name()), level);
+                            enchant.itemEnchantments.put(AutoEnchantConfig.shortId(enchantment.name()), level);
                             inEventLoop(() -> MODULE.get(AutoEnchantModule.class).onTradeListChange());
                             c.getSource().getEmbed()
                                 .title("Output Enchantment Added")
@@ -295,7 +298,7 @@ public class AutoEnchantCommand extends Command {
                             }
                             var enchant = PLUGIN_CONFIG.enchants.get(id);
                             var enchantment = getEnchantment(c, "enchant");
-                            enchant.itemEnchantments.remove(EnchantPresetCatalog.shortId(enchantment.name()));
+                            enchant.itemEnchantments.remove(AutoEnchantConfig.shortId(enchantment.name()));
                             inEventLoop(() -> MODULE.get(AutoEnchantModule.class).onTradeListChange());
                             c.getSource().getEmbed()
                                 .title("Output Enchantment Removed")
@@ -396,21 +399,114 @@ public class AutoEnchantCommand extends Command {
                 c.getSource().getEmbed()
                     .title("Wait For Interact Timeout Set");
             })))
+            .then(literal("actionDelay").then(argument("ticks", time()).executes(c -> {
+                // Delay between the actions of one submitted request: the server sees the clicks of a stack move as
+                // separate, human-paced interactions instead of one burst.
+                PLUGIN_CONFIG.actionDelay = getInteger(c, "ticks");
+                c.getSource().getEmbed()
+                    .title("Operation Delay Set")
+                    .addField("Delay", PLUGIN_CONFIG.actionDelay + " ticks between queued actions");
+            })))
+            .then(literal("restartDelay").then(argument("ticks", time()).executes(c -> {
+                // Backoff after a failed step or a stuck transaction before the next item is picked up.
+                PLUGIN_CONFIG.restartDelay = getInteger(c, "ticks");
+                c.getSource().getEmbed()
+                    .title("Restart Delay Set")
+                    .addField("Delay", PLUGIN_CONFIG.restartDelay + " ticks before retrying after a failure");
+            })))
+            .then(literal("experienceSource")
+                .then(argument("source", enumStrings(AutoEnchantConfig.ExperienceSource.values())).executes(c -> {
+                    var source = AutoEnchantConfig.ExperienceSource.valueOf(getString(c, "source").toUpperCase());
+                    PLUGIN_CONFIG.experienceSource = source;
+                    inEventLoop(() -> MODULE.get(AutoEnchantModule.class).onTradeListChange());
+                    c.getSource().getEmbed()
+                        .title("Experience Source Set")
+                        .addField("Source", source.name().toLowerCase());
+                })))
             .then(literal("logTradeStatusToDiscord").then(argument("toggle", toggle()).executes(c -> {
                 PLUGIN_CONFIG.logTradeStatusToDiscord = getToggle(c, "toggle");
                 c.getSource().getEmbed()
                     .title("Log Trade Status To Discord " + toggleStrCaps(PLUGIN_CONFIG.logTradeStatusToDiscord));
             })))
-            .then(literal("killSpot").then(argument("killSpot", blockPos()).executes(c -> {
-                var killSpotPos = getBlockPos(c, "killSpot");
+            .then(literal("renameOnly").then(argument("toggle", toggle()).executes(c -> {
+                // "不附魔仅改名": fetch, rename, unload - without a single merge. Existing enchantments are left alone,
+                // and a job needs no target enchantments while this is on.
+                PLUGIN_CONFIG.renameOnly = getToggle(c, "toggle");
+                inEventLoop(() -> MODULE.get(AutoEnchantModule.class).onTradeListChange());
+                c.getSource().getEmbed()
+                    .title("Rename Only " + toggleStrCaps(PLUGIN_CONFIG.renameOnly))
+                    .addField("Mode", PLUGIN_CONFIG.renameOnly
+                        ? "items are only renamed; no enchantment is applied"
+                        : "items are enchanted to their target set", false);
+            })))
+            .then(literal("ExpFarmSpot").then(argument("ExpFarmSpot", blockPos()).executes(c -> {
+                var killSpotPos = getBlockPos(c, "ExpFarmSpot");
                 if (World.isChunkLoadedBlockPos(killSpotPos.x(), killSpotPos.z())) {
                     var killSpotBlock = World.getBlock(killSpotPos);
                     c.getSource().getEmbed()
-                        .addField("Block At killSpot Pos", killSpotBlock.name());
+                        .addField("Block At ExpFarmSpot Pos", killSpotBlock.name());
                 }
-                PLUGIN_CONFIG.killSpot = killSpotPos.addY(1);
+                PLUGIN_CONFIG.ExpFarmSpot = killSpotPos.addY(1);
                 c.getSource().getEmbed()
-                    .title("killSpot Set");
+                    .title("ExpFarmSpot Set");
+            })))
+            .then(literal("anvil").then(argument("anvilPos", blockPos()).executes(c -> {
+                // The station the anvil is placed on when it breaks. It stays the authority even while no anvil
+                // stands there, because that is exactly the position the replacement is built on.
+                var anvilPos = getBlockPos(c, "anvilPos");
+                if (World.isChunkLoadedBlockPos(anvilPos.x(), anvilPos.z())) {
+                    c.getSource().getEmbed()
+                        .addField("Block At Anvil Pos", World.getBlock(anvilPos).name());
+                }
+                PLUGIN_CONFIG.anvil = anvilPos;
+                inEventLoop(() -> MODULE.get(AutoEnchantModule.class).onTradeListChange());
+                c.getSource().getEmbed()
+                    .title("Anvil Set")
+                    .addField("Position", anvilPos)
+                    .addField("Applies", "Where a replacement is placed when the anvil disappears", false);
+                return OK;
+            })))
+            .then(literal("anvilChest").then(argument("anvilChestPos", blockPos()).executes(c -> {
+                // The container the replacement anvil is withdrawn from; without it a broken anvil cannot be restored.
+                var anvilChestPos = getBlockPos(c, "anvilChestPos");
+                if (World.isChunkLoadedBlockPos(anvilChestPos.x(), anvilChestPos.z())) {
+                    c.getSource().getEmbed()
+                        .addField("Block At AnvilChest Pos", World.getBlock(anvilChestPos).name());
+                }
+                PLUGIN_CONFIG.anvilChest = anvilChestPos;
+                inEventLoop(() -> MODULE.get(AutoEnchantModule.class).onTradeListChange());
+                c.getSource().getEmbed()
+                    .title("AnvilChest Set")
+                    .addField("Position", anvilChestPos)
+                    .addField("Applies", "Supply chest for a replacement anvil", false);
+                return OK;
+            })))
+            .then(literal("xpBurst").then(argument("ticks", time()).executes(c -> {
+                // Length of one XP fight burst: the BOT fights for this long, stops, and the anvil cost is checked
+                // again. A still-short level starts the next burst; an affordable one ends the farm.
+                long ticks = Math.max(20L, Math.min(1200L, getInteger(c, "ticks")));
+                PLUGIN_CONFIG.xpBurstTicks = ticks;
+                c.getSource().getEmbed()
+                    .title("XP Burst Set")
+                    .addField("Fight duration", String.format(java.util.Locale.ROOT, "%.1fs", ticks * 50L / 1000.0)
+                        + " (" + ticks + " ticks)")
+                    .addField("Applies", "kill experience source: each burst fights this long, then the anvil cost is "
+                        + "checked again", false);
+                return OK;
+            })))
+            .then(literal("xpAccumulate").then(argument("levels", integer(0, 30)).executes(c -> {
+                // KILL source only: how many levels to bank past the anvil cost. The bot keeps fighting a few more
+                // seconds instead of stopping the instant the cost is covered.
+                int levels = Math.max(0, Math.min(30, getInteger(c, "levels")));
+                PLUGIN_CONFIG.xpAccumulateLevels = levels;
+                c.getSource().getEmbed()
+                    .title("XP Accumulate Set")
+                    .addField("Banked levels", levels == 0
+                        ? "0 - the farm stops as soon as the anvil cost is covered"
+                        : levels + " extra level(s) past the anvil cost")
+                    .addField("Applies", "kill experience source only; the anvil result is still taken as soon as the "
+                        + "cost is covered", false);
+                return OK;
             })))
             .then(literal("anvilRestock")
                 .executes(context -> {
@@ -469,9 +565,17 @@ public class AutoEnchantCommand extends Command {
             ctx.getEmbed()
                 .addField("AutoEnchant", toggleStr(PLUGIN_CONFIG.enabled))
                 .addField("Wait For Interact Timeout", PLUGIN_CONFIG.waitForInteractTimeoutTicks + " ticks")
-                .addField("KillSpot", PLUGIN_CONFIG.killSpot)
+                .addField("Action Delay", PLUGIN_CONFIG.actionDelay + " ticks")
+                .addField("Restart Delay", PLUGIN_CONFIG.restartDelay + " ticks")
+                .addField("Experience Source", PLUGIN_CONFIG.experienceSource.name().toLowerCase())
+                .addField("Rename Only", PLUGIN_CONFIG.renameOnly)
+                .addField("ExpFarmSpot", PLUGIN_CONFIG.ExpFarmSpot)
+                .addField("EXP Burst", String.format(java.util.Locale.ROOT, "%.1fs", PLUGIN_CONFIG.xpBurstTicks * 50L / 1000.0))
+                .addField("XP Accumulate", PLUGIN_CONFIG.xpAccumulateLevels + " level(s)")
+                .addField("Grindstone", PLUGIN_CONFIG.grindstone)
+                .addField("Anvil", PLUGIN_CONFIG.anvil)
                 .addField("AnvilChest", PLUGIN_CONFIG.anvilChest)
-                .addField("Item Frame Scan Range", "h" + PLUGIN_CONFIG.scanHorizontalBlocks + "v" + PLUGIN_CONFIG.scanVerticalBlocks + " blocks")
+                .addField("Item Frame Scan Range", "h:" + PLUGIN_CONFIG.scanHorizontalBlocks + "/n" + "v:" + PLUGIN_CONFIG.scanVerticalBlocks + " blocks")
                 .addField("Log Trade Status To Discord", PLUGIN_CONFIG.logTradeStatusToDiscord);
         }
         ctx.getEmbed()
@@ -502,7 +606,7 @@ public class AutoEnchantCommand extends Command {
             .append("`")
             .append(id)
             .append("`: [")
-            .append(EnchantPresetCatalog.shortId(enchant.item))
+            .append(AutoEnchantConfig.shortId(enchant.item))
             .append("] ")
             .append("`").append(enchant.inputItemChest).append("`");
         sb.append(" -> ");
