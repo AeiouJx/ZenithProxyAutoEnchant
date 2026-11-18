@@ -29,12 +29,31 @@ public class AutoEnchantConfig {
     public boolean allowGrindstone = false;
     public int anvilRestockStacks = 1;
     /**
-     * Batch size shared by every job: how many pieces of the selected equipment are withdrawn in one restock, and
-     * how many books of each enchantment type are taken for those pieces. One piece needs one book per target
-     * enchantment, so a batch of N pieces needs N books of every type. Global on purpose: sword, pickaxe, axe and
-     * shovel all use the same batch size, and the pieces of one batch are all enchanted before the next job is picked.
+     * Batch size shared by every job: how many pieces of the selected equipment are withdrawn in one restock. Global
+     * on purpose: sword, pickaxe, axe and shovel all use the same batch size, and the pieces of one batch are all
+     * enchanted before the next job is picked.
+     *
+     * <p>How many books that batch needs depends on {@link #batchOrder}: a row batch needs one book of every target
+     * enchantment per piece (7N books for N swords, so N is capped at 4 by the 36-slot bag), while a step batch only
+     * ever fetches the one or two book types of the step it is on (N is capped at about 11).
      */
     public int inputItemRestockStacks = 4;
+    /**
+     * How one batch is advanced.
+     *
+     * <p>{@code ROW} enchants one piece from its first merge to its last and only then picks the next piece, so the
+     * whole book set of the batch has to be carried at once. {@code STEP} takes the same batch but advances every
+     * piece by one merge step at a time: it fetches the books of one step, applies that step to all pieces, and only
+     * then fetches the books of the next step. Keeping the pieces in the bag until the batch is done is what allows a
+     * much larger batch in the same inventory.
+     */
+    public BatchOrder batchOrder = BatchOrder.ROW;
+    public enum BatchOrder {
+        /** One whole piece at a time: all its merges, then the next piece. */
+        ROW,
+        /** One merge step at a time: that step for every piece of the batch, then the next step. */
+        STEP
+    }
     /**
      * Rename-only mode ("不附魔仅改名"): an item is fetched, named at the anvil and unloaded again, without a single
      * merge. Jobs need no target enchantments in this mode, and an item that already carries enchantments is never

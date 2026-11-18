@@ -57,7 +57,8 @@ public class AutoEnchantCommand extends Command {
                 "scan",
                 "scanRange <horizontal> <vertical>",
                 "anvilRestock <stacks>",
-                "inputItemRestockStacks <count>"
+                "inputItemRestockStacks <count>",
+                "batchOrder <row/step>"
             )
             .build();
     }
@@ -523,18 +524,33 @@ public class AutoEnchantCommand extends Command {
                 .executes(context -> {
                     context.getSource().getEmbed().title("Input Item Restock Stacks")
                         .addField("Batch size", Integer.toString(PLUGIN_CONFIG.inputItemRestockStacks))
-                        .addField("Usage", "autoEnchant inputItemRestockStacks <1-8>", false)
-                        .addField("Applies", "Global: pieces of one equipment per restock, and books of each "
-                            + "enchantment type for that batch; all pieces are enchanted before the next job", false);
+                        .addField("Usage", "autoEnchant inputItemRestockStacks <1-32>", false)
+                        .addField("Applies", "Global: pieces of one equipment per restock. " + batchOrderHint(), false);
                     return OK;
                 })
-                .then(argument("count", integer(1, 8)).executes(context -> {
+                .then(argument("count", integer(1, 32)).executes(context -> {
                     int count = getInteger(context, "count");
                     PLUGIN_CONFIG.inputItemRestockStacks = count;
                     context.getSource().getEmbed().title("Input Item Restock Stacks Updated")
                         .addField("Batch size", Integer.toString(count))
-                        .addField("Applies", count + " pieces of the selected equipment per restock and " + count
-                            + " books of every needed type; the bag can cap the real withdrawal", false);
+                        .addField("Applies", count + " pieces of the selected equipment per restock; " + batchOrderHint(), false);
+                    return OK;
+                })))
+            .then(literal("batchOrder")
+                .executes(context -> {
+                    context.getSource().getEmbed().title("Batch Order")
+                        .addField("Order", PLUGIN_CONFIG.batchOrder.name().toLowerCase(), true)
+                        .addField("Usage", "autoEnchant batchOrder <row/step>", false)
+                        .addField("Applies", batchOrderHint(), false);
+                    return OK;
+                })
+                .then(argument("order", enumStrings(AutoEnchantConfig.BatchOrder.values())).executes(context -> {
+                    var order = AutoEnchantConfig.BatchOrder.valueOf(getString(context, "order").toUpperCase());
+                    PLUGIN_CONFIG.batchOrder = order;
+                    inEventLoop(() -> MODULE.get(AutoEnchantModule.class).onTradeListChange());
+                    context.getSource().getEmbed().title("Batch Order Set")
+                        .addField("Order", order.name().toLowerCase(), true)
+                        .addField("Applies", batchOrderHint(), false);
                     return OK;
                 })))
             .then(literal("scanRange")
@@ -588,6 +604,7 @@ public class AutoEnchantCommand extends Command {
                     PLUGIN_CONFIG.killWindowTicks * 50L / 1000.0, PLUGIN_CONFIG.killWindowIntervalTicks * 50L / 1000.0))
                 .addField("Kill Min Kills", PLUGIN_CONFIG.killWindowMinKills + " per window")
                 .addField("Batch Size (pieces/books)", PLUGIN_CONFIG.inputItemRestockStacks)
+                .addField("Batch Order", PLUGIN_CONFIG.batchOrder.name().toLowerCase())
                 .addField("Grindstone", PLUGIN_CONFIG.grindstone)
                 .addField("Anvil", PLUGIN_CONFIG.anvil)
                 .addField("AnvilChest", PLUGIN_CONFIG.anvilChest)
@@ -596,6 +613,15 @@ public class AutoEnchantCommand extends Command {
         }
         ctx.getEmbed()
             .primaryColor();
+    }
+
+    /** One line that tells the operator what the current batch order costs in book chest visits. */
+    private String batchOrderHint() {
+        return PLUGIN_CONFIG.batchOrder == AutoEnchantConfig.BatchOrder.STEP
+            ? "step order: every piece advances by one merge step, so only that step's one or two book types are "
+                + "carried and the batch can be much larger than 4"
+            : "row order: one piece is finished before the next, so all of its books are carried at once "
+                + "(4 pieces need 34 of the 36 slots)";
     }
 
     void inEventLoop(Runnable task) {

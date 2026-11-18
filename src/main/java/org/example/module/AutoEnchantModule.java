@@ -2059,16 +2059,19 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
-     * Finds the carried enchantItem that belongs to an enabled job, skipping items that just failed repeatedly. The
-     * most advanced piece wins: with several half-done swords in the bag, resuming the one closest to the target
-     * spends the fewest levels, and the barely-started ones wait their turn instead of being picked first forever.
+     * Finds the carried enchantItem that belongs to an enabled job, skipping items that just failed repeatedly.
+     *
+     * <p>Row order: the most advanced piece wins, so resuming the one closest to the target spends the fewest levels
+     * and the barely-started ones wait their turn instead of being picked first forever. Step order: the least
+     * advanced piece wins, which is what keeps a batch walking the merge tree in lockstep - the piece that already
+     * received the current step steps aside for the ones that have not.
      */
     private int findCarriedEquipment() { return findCarriedEquipment(null); }
 
     /** Same ranking, optionally restricted to the recorded batch's job so no other job can steal its turn. */
     private int findCarriedEquipment(AutoEnchantConfig.Enchant onlyJob) {
         int bestSlot = -1;
-        int bestScore = -1;
+        int bestScore = stepOrder() ? Integer.MAX_VALUE : -1;
         for (int slot = 9; slot <= 44; slot++) {
             ItemStack stack = playerItem(slot);
             if (stack == null) continue;
@@ -2080,7 +2083,7 @@ public class AutoEnchantModule extends Module {
             // without this guard beginInput would pick it up again and replay a no-op transaction forever.
             if (normalizedEnchants(stack).equals(targetEnchantsOf(job.get()))) continue;
             int score = progressScore(stack);
-            if (score > bestScore) { bestScore = score; bestSlot = slot; }
+            if (stepOrder() ? score < bestScore : score > bestScore) { bestScore = score; bestSlot = slot; }
         }
         return bestSlot;
     }
@@ -2339,20 +2342,21 @@ public class AutoEnchantModule extends Module {
                 operations = catalog().operations(activePreset, fullItemId(target.item));
                 books = catalog().requiredBooks(activePreset);
                 if (operations.isEmpty()) failureReason = "Target has no enchant operations";
-                return;
+            } else {
+                List<EnchantPresetCatalog.Enchant> wanted = customEnchantList();
+                if (wanted.isEmpty()) { failureReason = "Target has no enchantments"; return; }
+                var plan = CustomEnchantPlanner.plan(target.item, Map.of(), 0, wanted);
+                if (plan == null) {
+                    failureReason = "Target set cannot be applied within the 39-level anvil limit";
+                    return;
+                }
+                operations = plan.operations();
+                books = plan.books();
             }
-            List<EnchantPresetCatalog.Enchant> wanted = customEnchantList();
-            if (wanted.isEmpty()) { failureReason = "Target has no enchantments"; return; }
-            var plan = CustomEnchantPlanner.plan(target.item, Map.of(), 0, wanted);
-            if (plan == null) {
-                failureReason = "Target set cannot be applied within the 39-level anvil limit";
-                return;
-            }
-            operations = plan.operations();
-            books = plan.books();
         } catch (Exception e) {
             failureReason = "Could not build plan: " + e.getMessage();
         }
+        clampPlanToStep();
     }
 
     /** The target's enchantment list, in the order the operator entered it. */
@@ -2395,6 +2399,7 @@ public class AutoEnchantModule extends Module {
                 setWorkflowStatus("Item already matches the plan; unloading");
                 return true;
             }
+            clampPlanToStep();
             setWorkflowStatus("Resuming on the wiki merge tree: keeping " + current.size()
                 + " enchantment(s), " + books.size() + " book(s) and " + operations.size() + " merge(s) left");
             tracePlan();
@@ -2417,11 +2422,49 @@ public class AutoEnchantModule extends Module {
             setWorkflowStatus("Item already matches the plan; unloading");
             return true;
         }
+        clampPlanToStep();
         setWorkflowStatus("Resuming on the " + kind + ": keeping " + current.size()
             + " enchantment(s), " + books.size() + " book(s), " + operations.size() + " merge(s), about "
             + plan.predictedLevels() + " levels");
         tracePlan();
         return true;
+    }
+
+    /**
+     * True when a batch is advanced one merge step at a time ({@link AutoEnchantConfig.BatchOrder#STEP}): every piece
+     * of the batch receives the same step before the next step's books are fetched.
+     */
+    private boolean stepOrder() {
+        return PLUGIN_CONFIG.batchOrder == AutoEnchantConfig.BatchOrder.STEP;
+    }
+
+    /**
+     * Cuts the adopted plan down to the next merge step of the piece in hand.
+     *
+     * <p>Row order runs the whole plan before the next piece; step order runs only the operations up to the first one
+     * that produces the equipment - a merged book pair is built first, then applied to the sword - and keeps the rest
+     * for later passes. The remaining list stays 0-based as if the step were the whole plan, so the anvil loop, the
+     * preview check and the "plan finished" transition need no special case. The books of the step are the
+     * enchantment leaves of its result: a later step lists the earlier enchantments too, and {@code nextBook()} skips
+     * those because the piece already carries them.
+     */
+    private void clampPlanToStep() {
+        if (!stepOrder() || renamePass || operations.isEmpty()) return;
+        String placeholder = targetPlaceholder();
+        int end = -1;
+        for (int i = 0; i < operations.size(); i++) {
+            if (containsTarget(operations.get(i).result(), placeholder)) { end = i; break; }
+        }
+        if (end < 0) return;
+        operations = List.copyOf(operations.subList(0, end + 1));
+        List<EnchantPresetCatalog.Enchant> stepBooks = new ArrayList<>();
+        expectedEnchants(operations.get(end).result(), placeholder).entrySet().stream()
+            .sorted(Map.Entry.comparingByKey())
+            .forEach(entry -> stepBooks.add(new EnchantPresetCatalog.Enchant(entry.getKey(), entry.getValue())));
+        books = List.copyOf(stepBooks);
+        trace("batch step plan: {} merge(s) then back to the batch, {} book type(s) ({})", operations.size(),
+            books.size(), books.stream().map(b -> b.id() + " " + b.level())
+                .collect(java.util.stream.Collectors.joining(", ")));
     }
 
     /**
@@ -2735,6 +2778,10 @@ public class AutoEnchantModule extends Module {
      * per-type total is then reduced by the books already in the bag - including merged intermediates - so a batch of
      * four blank pieces withdraws four of each book and a batch of half-done pieces withdraws far fewer.
      *
+     * <p>In step order the demand is limited to the book types of the step the piece in hand is on, and the whole
+     * campaign is capped by the free bag slots. Ten blank swords therefore withdraw ten looting books, apply them,
+     * and only then come back for the next step's pair of types.
+     *
      * @return true when at least one chest has something to fetch
      */
     private boolean buildFetchQueue() {
@@ -2766,22 +2813,37 @@ public class AutoEnchantModule extends Module {
             if (!current.equals(targetEnchants)) pieces.add(current);
         }
 
+        // Step order only ever needs the book types of the step it is on. Fetching the whole target set would buy
+        // books for a step three charges ahead and fill the bag - the "inventory is full" loops of a big row batch.
+        List<EnchantPresetCatalog.Enchant> campaign = new ArrayList<>();
+        if (stepOrder() && !books.isEmpty()) {
+            for (EnchantPresetCatalog.Enchant book : books) if (!campaign.contains(book)) campaign.add(book);
+        } else {
+            targetEnchants.forEach((id, level) -> campaign.add(new EnchantPresetCatalog.Enchant(id, level)));
+        }
+
         Map<EnchantPresetCatalog.Enchant, Integer> want = new LinkedHashMap<>();
-        for (var entry : targetEnchants.entrySet()) {
-            String id = entry.getKey();
-            int level = entry.getValue();
+        for (EnchantPresetCatalog.Enchant book : campaign) {
+            String id = book.id();
+            int level = book.level();
             int lacking = 0;
             for (Map<String, Integer> current : pieces) {
                 if (current.getOrDefault(id, 0) < level) lacking++;
             }
             if (lacking <= 0) continue;
-            EnchantPresetCatalog.Enchant book = new EnchantPresetCatalog.Enchant(id, level);
             int deficit = lacking - carriedBookCopies(book);
             if (deficit > 0) want.put(book, deficit);
         }
+        // Never plan more books than the bag can accept right now: the withdraw click would bounce off a full
+        // inventory and the branch would park on "inventory is full". Types that do not fit are left for the next
+        // campaign; the merge phase notices the missing book and comes back for it.
+        int budget = Math.max(1, freeInventorySlots());
         for (var entry : want.entrySet()) {
+            if (budget <= 0) break;
             if (fetchEmpty.contains(entry.getKey())) continue;
-            fetchQueue.add(new BookFetch(entry.getKey(), entry.getValue()));
+            int take = Math.min(entry.getValue(), budget);
+            budget -= take;
+            fetchQueue.add(new BookFetch(entry.getKey(), take));
         }
         if (!fetchQueue.isEmpty()) {
             trace("book campaign planned for {} piece(s): {} type(s), {} book(s) to withdraw",
@@ -3188,6 +3250,9 @@ public class AutoEnchantModule extends Module {
             // window. Closing the anvil there costs a close packet, a path request and a fresh interact per merge,
             // which was most of the time a merge took.
             if (continueInAnvilWindow()) return;
+            // Step order: this piece's step is done, but a sibling piece of the batch still needs the same step. It
+            // continues in this window instead of paying another anvil opening.
+            if (continueBatchInAnvilWindow()) return;
             state = State.CLOSE_ANVIL;
             return;
         }
@@ -3230,6 +3295,66 @@ public class AutoEnchantModule extends Module {
         trace("merge[{}] starts in the still open anvil", operationIndex);
         state = State.ENCHANT_TRY_START;
         return true;
+    }
+
+    /**
+     * Step order only: the piece in hand just finished its merge step, but the batch is not done. The anvil stays
+     * open and the next carried piece of the batch starts its step in this same window, exactly like the next merge
+     * of one piece does. Ten pieces therefore cost one anvil opening per step instead of ten.
+     *
+     * <p>When the next piece's step inputs are already in the bag the merge starts at once; otherwise the adoption
+     * leaves the workflow in the normal book phase, which closes the window and comes back after the withdrawal.
+     *
+     * @return true when the workflow continues on the adopted piece and the caller must not close the anvil
+     */
+    private boolean continueBatchInAnvilWindow() {
+        if (!stepOrder() || renamePass || batchJob == null) return false;
+        int id = openContainerId();
+        if (id == 0 || id != activeContainerId) return false;
+        Container container = openContainer();
+        if (container == null || container.getType() != ContainerType.ANVIL) return false;
+        if (!stationInputEmpty(0) || !stationInputEmpty(1)) return false;
+        int next = findNextStepPiece();
+        if (next < 0) return false;
+        // Hand the transaction over to the next piece without closing the window: clearTransaction() drops every
+        // per-piece field, then adoptCarried() plans the piece exactly like beginInput would.
+        clearTransaction();
+        activeContainerId = id;
+        adoptCarried(next);
+        // The adopted piece owns the workflow now, whatever it decided: continue the step here, restock its books,
+        // rename it, reset it or unload it. Falling back to CLOSE_ANVIL would overwrite that decision with a plain
+        // close.
+        if (failureReason == null && !renamePass && !grindRequired && !operations.isEmpty() && inputsReady()) {
+            trace("batch step continues in the still open anvil with slot {}", next);
+            state = State.ENCHANT_TRY_START;
+        } else {
+            // The adopted plan closes or reopens the window on its own (book restock, rename, relocate, unload).
+            trace("batch step of slot {} is handed to its own plan ({} merge(s), {} book(s))", next,
+                operations.size(), books.size());
+        }
+        return true;
+    }
+
+    /**
+     * Least advanced unfinished piece of the open batch. The piece that just finished a step carries more than the
+     * others, so it steps aside; when every piece is at the same point one of them simply starts the next step.
+     */
+    private int findNextStepPiece() {
+        if (batchJob == null) return -1;
+        Map<String, Integer> wanted = targetEnchantsOf(batchJob);
+        int itemId = configuredItemId();
+        int best = -1;
+        int bestScore = Integer.MAX_VALUE;
+        for (int slot = 9; slot <= 44; slot++) {
+            ItemStack stack = playerItem(slot);
+            if (stack == null || stack.getId() != itemId) continue;
+            if (runnableJobFor(stack).orElse(null) != batchJob) continue;
+            if (isCoolingDown(stack) || catalog().hasCurse(stack)) continue;
+            if (normalizedEnchants(stack).equals(wanted)) continue;
+            int score = progressScore(stack);
+            if (score < bestScore) { bestScore = score; best = slot; }
+        }
+        return best;
     }
 
     /**
@@ -4066,6 +4191,15 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
+     * True when the piece in hand already carries its job's whole target set, i.e. its last merge step is done. In row
+     * order that is the end of the piece; in step order an intermediate step leaves the piece unfinished in the bag.
+     */
+    private boolean pieceFinished() {
+        return itemSnapshot != null && normalizedEnchants(itemSnapshot).equals(targetEnchants)
+            && !targetEnchants.isEmpty();
+    }
+
+    /**
      * Slots occupied by this job's batch: raw, half-done AND finished pieces. Restock sizes itself from this count,
      * not from {@link #countPendingPieces()}: a finished piece is still one of the batch's four slots until the whole
      * batch is unloaded together. Counting only pending pieces made every finished piece look like a free slot, so
@@ -4216,21 +4350,31 @@ public class AutoEnchantModule extends Module {
      * One piece of the batch is fully enchanted. The finished product stays in the bag while sibling pieces of the
      * same job still need work, so the whole batch can be unloaded in a single trip instead of one chest visit per
      * piece. Only the last piece of the batch opens the unload container.
+     *
+     * <p>In step order this point is reached after every step, not only after the last merge of a piece: the piece
+     * stays in the bag with the progress it just paid for, and only a piece that really reached its target set is
+     * logged as complete.
      */
     private void batchNextPiece() {
         if (openContainerId() != 0) { closeContainer(State.BATCH_NEXT_PIECE); return; }
         int pending = countPendingPieces();
         if (pending > 0) {
-            // Not the last piece: log this piece as done, keep the product in the bag, and let beginInput adopt the
-            // next carried piece. The job cursor must not rotate here - the whole batch belongs to this job.
-            logTransaction(true);
+            // Not the last piece: keep the product in the bag, log this piece as done if it is, and let beginInput
+            // adopt the next carried piece. The job cursor must not rotate here - the whole batch belongs to this job.
+            boolean finished = !stepOrder() || pieceFinished();
+            if (finished) logTransaction(true);
             retryReason = null;
             clearTransaction();
             itemAttempts.clear();
             transientRetries = 0;
             flushTrips = 0;
-            trace("batch: finished piece kept in bag, {} piece(s) of this job still pending", pending);
-            setWorkflowStatus("Batch: piece done, continuing with the next carried piece");
+            if (finished) {
+                trace("batch: finished piece kept in bag, {} piece(s) of this job still pending", pending);
+                setWorkflowStatus("Batch: piece done, continuing with the next carried piece");
+            } else {
+                trace("batch step done: progress kept in the bag, {} piece(s) of this job still pending", pending);
+                setWorkflowStatus("Batch: step done, continuing with the next carried piece");
+            }
             state = State.NEXT_ENCHANT;
             return;
         }
