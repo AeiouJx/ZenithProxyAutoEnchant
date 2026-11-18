@@ -51,11 +51,13 @@ public class AutoEnchantCommand extends Command {
                 "ExpFarmSpot <x> <y> <z>",
                 "anvil <x> <y> <z>",
                 "anvilChest <x> <y> <z>",
-                "xpBurst <ticks>",
-                "xpAccumulate <levels>",
+                "killWindow <ticks>",
+                "killGap <ticks>",
+                "killMinKills <kills>",
                 "scan",
                 "scanRange <horizontal> <vertical>",
-                "anvilRestock <stacks>"
+                "anvilRestock <stacks>",
+                "inputItemRestockStacks <count>"
             )
             .build();
     }
@@ -202,24 +204,6 @@ public class AutoEnchantCommand extends Command {
                         inEventLoop(() -> MODULE.get(AutoEnchantModule.class).onTradeListChange());
                         c.getSource().getEmbed()
                             .title("Output Chest Set")
-                            .description(printEnchant(id, enchant));
-                        return OK;
-                    })))
-                    .then(literal("inputItemRestockStacks").then(argument("inputItemRestockStacks", integer(1, 35)).executes(c -> {
-                        var id = CustomStringArgumentType.getString(c, "id");
-                        if (!PLUGIN_CONFIG.enchants.containsKey(id)) {
-                            c.getSource().getEmbed()
-                                .title("Enchant ID Not Found")
-                                .addField("Enchant ID", id)
-                                .description(printAllEnchants());
-                            c.getSource().getData().put("list", true);
-                            return ERROR;
-                        }
-                        var enchant = PLUGIN_CONFIG.enchants.get(id);
-                        enchant.inputItemRestockStacks = getInteger(c, "inputItemRestockStacks");
-                        inEventLoop(() -> MODULE.get(AutoEnchantModule.class).onTradeListChange());
-                        c.getSource().getEmbed()
-                            .title("Input Item Restock Stacks Set")
                             .description(printEnchant(id, enchant));
                         return OK;
                     })))
@@ -481,31 +465,43 @@ public class AutoEnchantCommand extends Command {
                     .addField("Applies", "Supply chest for a replacement anvil", false);
                 return OK;
             })))
-            .then(literal("xpBurst").then(argument("ticks", time()).executes(c -> {
-                // Length of one XP fight burst: the BOT fights for this long, stops, and the anvil cost is checked
-                // again. A still-short level starts the next burst; an affordable one ends the farm.
-                long ticks = Math.max(20L, Math.min(1200L, getInteger(c, "ticks")));
-                PLUGIN_CONFIG.xpBurstTicks = ticks;
+            .then(literal("killWindow").then(argument("ticks", time()).executes(c -> {
+                // One kill window: KillAura on for this long at the exp spot, a few silverfish die, and the aura goes
+                // off again so the enchant work continues. 0 disables the windows.
+                long ticks = Math.max(0L, Math.min(1200L, getInteger(c, "ticks")));
+                PLUGIN_CONFIG.killWindowTicks = ticks;
                 c.getSource().getEmbed()
-                    .title("XP Burst Set")
-                    .addField("Fight duration", String.format(java.util.Locale.ROOT, "%.1fs", ticks * 50L / 1000.0)
-                        + " (" + ticks + " ticks)")
-                    .addField("Applies", "kill experience source: each burst fights this long, then the anvil cost is "
-                        + "checked again", false);
+                    .title("Kill Window Set")
+                    .addField("Duration", ticks == 0
+                        ? "0 - windows disabled, the aura is only used while farming a level"
+                        : String.format(java.util.Locale.ROOT, "%.1fs", ticks * 50L / 1000.0) + " (" + ticks + " ticks)")
+                    .addField("Applies", "kill experience source: the BOT clears some silverfish, then goes back to "
+                        + "the anvil and the chests", false);
                 return OK;
             })))
-            .then(literal("xpAccumulate").then(argument("levels", integer(0, 30)).executes(c -> {
-                // KILL source only: how many levels to bank past the anvil cost. The bot keeps fighting a few more
-                // seconds instead of stopping the instant the cost is covered.
-                int levels = Math.max(0, Math.min(30, getInteger(c, "levels")));
-                PLUGIN_CONFIG.xpAccumulateLevels = levels;
+            .then(literal("killGap").then(argument("ticks", time()).executes(c -> {
+                // Minimum gap between two window starts: the farm deletes a mob that was left alive for about nine
+                // seconds, so a window has to come around well inside that.
+                long ticks = Math.max(20L, Math.min(1200L, getInteger(c, "ticks")));
+                PLUGIN_CONFIG.killWindowIntervalTicks = ticks;
                 c.getSource().getEmbed()
-                    .title("XP Accumulate Set")
-                    .addField("Banked levels", levels == 0
-                        ? "0 - the farm stops as soon as the anvil cost is covered"
-                        : levels + " extra level(s) past the anvil cost")
-                    .addField("Applies", "kill experience source only; the anvil result is still taken as soon as the "
-                        + "cost is covered", false);
+                    .title("Kill Gap Set")
+                    .addField("Gap", String.format(java.util.Locale.ROOT, "%.1fs", ticks * 50L / 1000.0)
+                        + " (" + ticks + " ticks)")
+                    .addField("Applies", "kill experience source: a window starts at most every this many ticks, and "
+                        + "one more before a container is opened", false);
+                return OK;
+            })))
+            .then(literal("killMinKills").then(argument("kills", integer(0, 64)).executes(c -> {
+                // A window ends early once this many silverfish died in it, so a productive farm is not waited on.
+                int kills = Math.max(0, Math.min(64, getInteger(c, "kills")));
+                PLUGIN_CONFIG.killWindowMinKills = kills;
+                c.getSource().getEmbed()
+                    .title("Kill Minimum Set")
+                    .addField("Kills per window", kills == 0
+                        ? "0 - every window runs its full duration"
+                        : kills + " silverfish")
+                    .addField("Applies", "kill experience source only", false);
                 return OK;
             })))
             .then(literal("anvilRestock")
@@ -523,6 +519,24 @@ public class AutoEnchantCommand extends Command {
                         .addField("Applies", "When the anvil block disappears and the BOT has none", false);
                     return OK;
             })))
+            .then(literal("inputItemRestockStacks")
+                .executes(context -> {
+                    context.getSource().getEmbed().title("Input Item Restock Stacks")
+                        .addField("Batch size", Integer.toString(PLUGIN_CONFIG.inputItemRestockStacks))
+                        .addField("Usage", "autoEnchant inputItemRestockStacks <1-8>", false)
+                        .addField("Applies", "Global: pieces of one equipment per restock, and books of each "
+                            + "enchantment type for that batch; all pieces are enchanted before the next job", false);
+                    return OK;
+                })
+                .then(argument("count", integer(1, 8)).executes(context -> {
+                    int count = getInteger(context, "count");
+                    PLUGIN_CONFIG.inputItemRestockStacks = count;
+                    context.getSource().getEmbed().title("Input Item Restock Stacks Updated")
+                        .addField("Batch size", Integer.toString(count))
+                        .addField("Applies", count + " pieces of the selected equipment per restock and " + count
+                            + " books of every needed type; the bag can cap the real withdrawal", false);
+                    return OK;
+                })))
             .then(literal("scanRange")
                 .then(argument("horizontal", integer(1, 256)).executes(c -> {
                     PLUGIN_CONFIG.scanHorizontalBlocks = getInteger(c, "horizontal");
@@ -570,8 +584,10 @@ public class AutoEnchantCommand extends Command {
                 .addField("Experience Source", PLUGIN_CONFIG.experienceSource.name().toLowerCase())
                 .addField("Rename Only", PLUGIN_CONFIG.renameOnly)
                 .addField("ExpFarmSpot", PLUGIN_CONFIG.ExpFarmSpot)
-                .addField("EXP Burst", String.format(java.util.Locale.ROOT, "%.1fs", PLUGIN_CONFIG.xpBurstTicks * 50L / 1000.0))
-                .addField("XP Accumulate", PLUGIN_CONFIG.xpAccumulateLevels + " level(s)")
+                .addField("Kill Window", String.format(java.util.Locale.ROOT, "%.1fs on / %.1fs gap",
+                    PLUGIN_CONFIG.killWindowTicks * 50L / 1000.0, PLUGIN_CONFIG.killWindowIntervalTicks * 50L / 1000.0))
+                .addField("Kill Min Kills", PLUGIN_CONFIG.killWindowMinKills + " per window")
+                .addField("Batch Size (pieces/books)", PLUGIN_CONFIG.inputItemRestockStacks)
                 .addField("Grindstone", PLUGIN_CONFIG.grindstone)
                 .addField("Anvil", PLUGIN_CONFIG.anvil)
                 .addField("AnvilChest", PLUGIN_CONFIG.anvilChest)

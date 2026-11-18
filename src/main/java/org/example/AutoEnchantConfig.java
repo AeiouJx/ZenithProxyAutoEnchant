@@ -29,6 +29,13 @@ public class AutoEnchantConfig {
     public boolean allowGrindstone = false;
     public int anvilRestockStacks = 1;
     /**
+     * Batch size shared by every job: how many pieces of the selected equipment are withdrawn in one restock, and
+     * how many books of each enchantment type are taken for those pieces. One piece needs one book per target
+     * enchantment, so a batch of N pieces needs N books of every type. Global on purpose: sword, pickaxe, axe and
+     * shovel all use the same batch size, and the pieces of one batch are all enchanted before the next job is picked.
+     */
+    public int inputItemRestockStacks = 4;
+    /**
      * Rename-only mode ("不附魔仅改名"): an item is fetched, named at the anvil and unloaded again, without a single
      * merge. Jobs need no target enchantments in this mode, and an item that already carries enchantments is never
      * ground blank for not matching a target set.
@@ -38,16 +45,25 @@ public class AutoEnchantConfig {
     public int actionDelay = 5;
     public long restartDelay = 5L;
     /**
-     * Length of one XP burst. The BOT fights for this long, stops, and the anvil cost is checked again: enough XP ends
-     * the farming, still too little starts the next burst. 100 ticks = 5 seconds.
+     * KILL experience source only. Length of one kill window: the BOT stands at {@code ExpFarmSpot}, KillAura is
+     * switched on for this long, a few silverfish die, and the aura is switched off again so the enchant work can
+     * continue. 40 ticks = 2 seconds.
+     *
+     * <p>The farm spot is the place the BOT already works from (anvil, pickup chest and book chests are all within
+     * reach), so a window is a short interruption of the enchant loop, not a trip: the silverfish farm is culled by
+     * the server when a mob is not killed for about nine seconds, which is exactly what these windows prevent.
      */
-    public long xpBurstTicks = 100L;
+    public long killWindowTicks = 40L;
     /**
-     * KILL experience source only: extra levels farmed past the anvil cost before the farm stops, so a merge that
-     * becomes affordable mid-fight does not end the farm immediately and the next merge does not need another trip.
-     * 0 disables the extra farming. The anvil result itself is taken as soon as the cost is covered.
+     * KILL experience source only: minimum gap between the start of two kill windows. 60 ticks = 3 seconds, i.e. one
+     * window per three seconds of enchant work, and one more before a container is opened.
      */
-    public int xpAccumulateLevels = 3;
+    public long killWindowIntervalTicks = 60L;
+    /**
+     * KILL experience source only: a window ends as soon as this many silverfish died in it, without waiting for the
+     * timer. 0 makes every window run its full length.
+     */
+    public int killWindowMinKills = 2;
 
     public int scanHorizontalBlocks = 8;
     public int scanVerticalBlocks = 8;
@@ -67,7 +83,6 @@ public class AutoEnchantConfig {
         public String item = ItemRegistry.AIR.name();
         public BlockPos inputItemChest = BlockPos.ZERO;
         public BlockPos outputChest = BlockPos.ZERO;
-        public int inputItemRestockStacks = 1;
 
         /**
          * Text written into the anvil's name field, exactly like a player typing in the "Repair & Name" box:
@@ -138,6 +153,24 @@ final class AutoEnchantConfigSerializer implements ConfigSerializer {
 
     private void normalize(JsonObject root) {
         for (String field : ROOT_POSITIONS) convertPosition(root, field);
+
+        // The batch size used to live on each job. Lift the first configured value to the global field so an
+        // existing install keeps its setting; the per-job copies are dropped by convertJob below.
+        JsonElement batch = root.get("inputItemRestockStacks");
+        if ((batch == null || !batch.isJsonPrimitive() || !batch.getAsJsonPrimitive().isNumber())) {
+            JsonObject configured = root.getAsJsonObject("enchants");
+            if (configured != null) {
+                for (String key : configured.keySet()) {
+                    JsonElement job = configured.get(key);
+                    if (job == null || !job.isJsonObject()) continue;
+                    JsonElement old = job.getAsJsonObject().get("inputItemRestockStacks");
+                    if (old != null && old.isJsonPrimitive() && old.getAsJsonPrimitive().isNumber()) {
+                        root.add("inputItemRestockStacks", old.deepCopy());
+                        break;
+                    }
+                }
+            }
+        }
 
         JsonObject books = root.getAsJsonObject("enchantBook");
         if (books != null) {
@@ -215,6 +248,10 @@ final class AutoEnchantConfigSerializer implements ConfigSerializer {
         root.remove("minimumHealth");
         root.remove("killAuraMaxSeconds");
         root.remove("noXpTimeoutMs");
+        // Superseded by the kill windows (killWindowTicks / killWindowIntervalTicks / killWindowMinKills): the farm
+        // is no longer a burst with a level check between fights.
+        root.remove("xpBurstTicks");
+        root.remove("xpAccumulateLevels");
         root.remove("allowedXpDimensions");
         root.remove("customImpurityPolicy");
         root.remove("grindstoneThreshold");
@@ -261,6 +298,7 @@ final class AutoEnchantConfigSerializer implements ConfigSerializer {
         // coordinate is dropped instead of being migrated into a role that no longer reads it.
         object.remove("semiFinishedChest");
         object.remove("overflowChestPos");
+        object.remove("inputItemRestockStacks"); // now a global setting, migrated in normalize()
         rename(object, "postJobStoreMode", "postEnchantStoreMode");
         convertEnchantmentList(object);
         normalizeEnchantmentMap(object);

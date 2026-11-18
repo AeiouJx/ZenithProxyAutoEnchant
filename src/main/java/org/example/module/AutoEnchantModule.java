@@ -123,10 +123,10 @@ public class AutoEnchantModule extends Module {
     private static final int LAMP_SCAN_HEIGHT = 8;
     private static final int RESERVE_LEVELS = 2;
     private static final float MIN_HEALTH = 12;
-    /** Hard ceiling for one XP goal: a farm that runs this long has a problem, whatever the bursts report. */
+    /** Hard ceiling for one XP goal: a farm that runs this long has a problem, whatever the level check says. */
     private static final int KILLAURA_MAX_SECONDS = 900;
-    /** Consecutive bursts without a single XP point before the farm gives up: the spot is not producing. */
-    private static final int MAX_EMPTY_XP_BURSTS = 6;
+    /** A farm that did not gain a single level in this long is not producing: the spot is empty or the aura is stuck. */
+    private static final long NO_XP_PROGRESS_MS = 30_000L;
 
     private final EnchantPresetCatalog catalog = new EnchantPresetCatalog();
     {
@@ -162,18 +162,14 @@ public class AutoEnchantModule extends Module {
     private volatile boolean killAuraUserSetting;
     private volatile boolean xpFarmingActive;
     private volatile boolean xpInterrupted;
-    /** Level the current anvil operation needs, taken from the cost the server shows in the anvil window. */
+    /** Level the current anvil operation needs, taken from the plan or from the cost the anvil window shows. */
     private volatile int xpGoalLevel = -1;
     /** The anvil cost that produced {@link #xpGoalLevel}, kept for the status line. */
     private volatile int xpGoalCost = -1;
-    /** Wall-clock start of the running fight burst; 0 while no burst is running. */
-    private volatile long xpBurstStartedAt;
-    /** Total XP when the burst started, so a burst that gained nothing can be told apart from a good one. */
-    private volatile int xpBurstStartExperience;
-    /** Consecutive bursts that gained no XP at all; see {@link #MAX_EMPTY_XP_BURSTS}. */
-    private int xpBurstsWithoutProgress;
-    /** Wall-clock start of the whole farm for the current goal, used only for the hard ceiling. */
+    /** Wall-clock start of the running farm; 0 while the BOT is not farming. */
     private volatile long xpFarmStartedAt;
+    /** Level when the farm started, so a farm that gains nothing can be told apart from a slow one. */
+    private volatile int xpFarmStartLevel;
     private volatile double xpLastX, xpLastY, xpLastZ;
     private volatile String xpStartDimension;
     private volatile PathingRequestFuture killSpotPath;
@@ -181,6 +177,15 @@ public class AutoEnchantModule extends Module {
     private int killSpotAttempts;
     private static final long KILL_SPOT_TIMEOUT_MS = 60_000L;
     private static final int MAX_KILL_SPOT_ATTEMPTS = 3;
+    /** Radius around the BOT that counts as "silverfish at the farm"; the kill window is measured against it. */
+    private static final double KILL_WINDOW_RADIUS = 12.0;
+    /** Start of the last kill window; the gap in the config is measured from here. */
+    private volatile long lastKillWindowAt;
+    private volatile long killWindowStartedAt;
+    /** Silverfish alive at the start of the window, so kills are counted without a hit hook. */
+    private volatile long killWindowStartMobs;
+    /** Step the workflow returns to when the window closes. */
+    private State afterKillWindowState = State.ENTRYPOINT;
 
     @Override
     public boolean enabledSetting() {
@@ -213,10 +218,18 @@ public class AutoEnchantModule extends Module {
         switchKillAura(false);
     }
 
-    public int getPriority() { return Baritone.getPriority() + 100; }
+    public int getPriority() {
+        // Above both Baritone and the BOT's own KillAura. The kill windows switch the aura on and off constantly;
+        // KillAura submits high-priority noAction requests while it runs, so a priority based on Baritone alone lets
+        // it steal every inventory click and submit() comes back rejected over and over.
+        KillAura aura = MODULE.get(KillAura.class);
+        return Math.max(Baritone.getPriority(), aura == null ? Integer.MIN_VALUE : aura.getPriority()) + 100;
+    }
 
     private void reset() {
         BARITONE.stop();
+        missingContainerUntil.clear();
+        missingContainerMisses.clear();
         state =  State.ENTRYPOINT;
         waitForInteractTimer.reset();
         waitForRestockTimer.reset();
@@ -225,6 +238,10 @@ public class AutoEnchantModule extends Module {
         switchKillAura(false);
         xpInterrupted = false;
         abort();
+        // Batch markers are per-session: stale counts from a previous run would hand fresh-item treatment to pieces
+        // that were already in the bag, and a stale latch would block every future fetch.
+        restockBatch.clear();
+        closeBatch();
         enchantIterator.reset();
         resetEnchantCounter();
     }
@@ -1080,32 +1097,127 @@ public class AutoEnchantModule extends Module {
         lastAnvilCostAt = 0;
     }
 
-    /** Length of one fight burst in milliseconds, from the config (100 ticks = 5 seconds by default). */
-    private long xpBurstMs() {
-        return Math.max(1L, AutoEnchantPlugin.PLUGIN_CONFIG.xpBurstTicks) * 50L;
+    /** Length of one kill window in milliseconds, from the config (40 ticks = 2 seconds by default). */
+    private long killWindowMs() {
+        return Math.max(0L, AutoEnchantPlugin.PLUGIN_CONFIG.killWindowTicks) * 50L;
+    }
+
+    /** Minimum gap between two window starts in milliseconds (60 ticks = 3 seconds by default). */
+    private long killWindowGapMs() {
+        return Math.max(1L, AutoEnchantPlugin.PLUGIN_CONFIG.killWindowIntervalTicks) * 50L;
+    }
+
+    /** One window as a short human-readable string, e.g. {@code 2.0s on / 3.0s gap}. */
+    private String killWindowText() {
+        return String.format(java.util.Locale.ROOT, "%.1fs on / %.1fs gap",
+            killWindowMs() / 1000.0, killWindowGapMs() / 1000.0);
     }
 
     /**
-     * Extra levels the KILL farm keeps fighting for after the anvil cost is covered, so the next merge is already paid
-     * for. Other sources never farm extra: EXP waits for exactly the cost, NONE does not fight at all.
-     */
-    private int xpAccumulateLevels() {
-        if (AutoEnchantPlugin.PLUGIN_CONFIG.experienceSource != AutoEnchantConfig.ExperienceSource.KILL) return 0;
-        return Math.max(0, AutoEnchantPlugin.PLUGIN_CONFIG.xpAccumulateLevels);
-    }
-
-    /**
-     * Starts one XP burst: walks to the configured kill spot, switches the BOT's own KillAura on and lets it fight for
-     * {@link #xpBurstMs()}. {@link #monitorXpFarming()} ends the burst, the caller then re-checks the anvil cost and
-     * starts the next burst only when the level is still short.
+     * True when the next short fight is due.
      *
-     * <p>This is the whole point of the burst: the farm is a series of short fights with a level check in between, not
-     * one endless fight for a level that may already be affordable.
+     * <p>Only the KILL source fights, a configured window length of 0 disables the windows entirely, and a running XP
+     * goal keeps the aura on continuously - that is a farm, not a window, so no window may cut into it.
+     */
+    private boolean killWindowDue() {
+        if (AutoEnchantPlugin.PLUGIN_CONFIG.experienceSource != AutoEnchantConfig.ExperienceSource.KILL) return false;
+        if (AutoEnchantPlugin.PLUGIN_CONFIG.killWindowTicks <= 0) return false;
+        if (xpFarmingActive) return false;
+        // Only at the exp spot: a window is a short interruption of the enchant work there, never a fight somewhere
+        // else on the map (walking, a distant anvil) where the silverfish farm is not the point.
+        if (!atExpSpot()) return false;
+        return System.currentTimeMillis() - lastKillWindowAt >= killWindowGapMs();
+    }
+
+    /** True when no exp spot is configured, or the BOT stands within its interaction tolerance of it. */
+    private boolean atExpSpot() {
+        BlockPos spot = AutoEnchantPlugin.PLUGIN_CONFIG.ExpFarmSpot;
+        if (spot == null || BlockPos.ZERO.equals(spot)) return true;
+        var player = CACHE.getPlayerCache().getThePlayer();
+        if (player == null) return false;
+        double dx = player.getX() - (spot.x() + 0.5);
+        double dy = player.getY() - spot.y();
+        double dz = player.getZ() - (spot.z() + 0.5);
+        return dx * dx + dz * dz <= 9.0 && Math.abs(dy) <= 4.0;
+    }
+
+    /**
+     * Starts one kill window: KillAura on, the current step remembered, and the workflow parked until
+     * {@link #tickKillWindow()} sees enough silverfish dead (or the window ran out).
+     *
+     * <p>This is the anti-cull mechanism. The silverfish farm deletes a mob that was left alive for about nine
+     * seconds, so a long stretch of container work must be interrupted by a few swings instead of being run in one
+     * go. Killing a couple of them every few seconds also keeps the orbs small and close: one big kill at the end of
+     * a long pause drops them all at once and much of that XP is never picked up.
+     *
+     * @return false when there is nothing to kill around the BOT; the caller then simply continues with its own step,
+     *     so an empty farm costs no time at all
+     */
+    private boolean beginKillWindow(State resume) {
+        long nearby = countSilverfish();
+        if (nearby <= 0) {
+            // Nothing to clear: the window would only stand around with the aura on. The gap is still consumed, so an
+            // empty farm does not retry the check on every single tick.
+            lastKillWindowAt = System.currentTimeMillis();
+            return false;
+        }
+        afterKillWindowState = resume;
+        killWindowStartedAt = System.currentTimeMillis();
+        lastKillWindowAt = killWindowStartedAt;
+        killWindowStartMobs = nearby;
+        switchKillAura(true);
+        state = State.KILL_WINDOW;
+        status = "Killing a few silverfish at the exp spot (" + killWindowText() + ") before the next step";
+        trace("[trace] kill window opened: {} silverfish nearby, resuming at {}", nearby, resume);
+        return true;
+    }
+
+    /** Closes the window once enough silverfish died or its time is up, then hands the workflow back. */
+    private void tickKillWindow() {
+        if (openContainerId() != 0) {
+            // A window never runs behind an open screen: the server drops attacks while a GUI is up.
+            closeContainer(State.KILL_WINDOW);
+            return;
+        }
+        long killed = killWindowStartMobs - countSilverfish();
+        long elapsed = System.currentTimeMillis() - killWindowStartedAt;
+        int target = Math.max(1, AutoEnchantPlugin.PLUGIN_CONFIG.killWindowMinKills);
+        if (killed < target && elapsed < killWindowMs()) return;
+        switchKillAura(false);
+        lastKillWindowAt = System.currentTimeMillis();
+        state = afterKillWindowState;
+        trace("[trace] kill window closed: {} silverfish killed in {}ms", killed, elapsed);
+    }
+
+    /** Silverfish alive around the BOT, i.e. what a kill window is measured against. */
+    private long countSilverfish() {
+        var player = CACHE.getPlayerCache().getThePlayer();
+        if (player == null) return 0;
+        double radiusSq = KILL_WINDOW_RADIUS * KILL_WINDOW_RADIUS;
+        long count = 0;
+        for (Entity entity : CACHE.getEntityCache().getEntities().values()) {
+            if (!(entity instanceof com.zenith.cache.data.entity.EntityLiving living)) continue;
+            if (!living.isAlive() || living.getEntityType() != EntityType.SILVERFISH) continue;
+            double dx = living.getX() - player.getX();
+            double dy = living.getY() - player.getY();
+            double dz = living.getZ() - player.getZ();
+            if (dx * dx + dy * dy + dz * dz <= radiusSq) count++;
+        }
+        return count;
+    }
+
+    /**
+     * Starts farming: walks to the configured exp spot, switches the BOT's own KillAura on and leaves it on until
+     * {@link #monitorXpFarming()} sees the goal reached.
+     *
+     * <p>The spot is where the BOT already works from - anvil, pickup chest and every book chest are within reach -
+     * so this is not a trip: the aura simply stays on while the workflow waits for the level. That is why there is no
+     * burst timer any more; a burst only made sense when farming meant walking somewhere.
      *
      * @return false while the BOT is still walking to the spot, and also when farming cannot start at all; only the
      *     latter marks the XP wait as interrupted (see {@link #consumeXpInterruption()})
      */
-    public synchronized boolean startXpBurst() {
+    public synchronized boolean startFarming() {
         var player = CACHE.getPlayerCache().getThePlayer();
         if (player == null) { xpInterrupted = true; return false; }
         // Only KILL fights; EXP and NONE wait for the level without touching the aura (see ensureXpForCost).
@@ -1116,29 +1228,23 @@ public class AutoEnchantModule extends Module {
             return false;
         }
         String dimension = World.getCurrentDimension().name();
-        // The grind spot is a place to fight from, not a teleport: the burst only starts once the BOT stands there.
+        // The spot is a place to fight from, not a teleport: the farm only starts once the BOT stands there.
         if (!reachKillSpot()) return false;
         switchKillAura(true);
         xpFarmingActive = true;
         xpInterrupted = false;
         long now = System.currentTimeMillis();
-        xpBurstStartedAt = now;
-        xpBurstStartExperience = player.getTotalExperience();
-        if (xpFarmStartedAt <= 0) xpFarmStartedAt = now;
+        xpFarmStartedAt = now;
+        xpFarmStartLevel = player.getLevel();
         xpLastX = player.getX();
         xpLastY = player.getY();
         xpLastZ = player.getZ();
         xpStartDimension = dimension;
-        status = "Fighting for XP: level " + player.getLevel() + " / goal " + xpGoalLevel
-            + " (" + burstText() + " burst, anvil cost " + xpGoalCost + ")";
-        info("[trace] XP burst started ({}): level {} -> goal {} (anvil cost {}, XP {})",
-            burstText(), player.getLevel(), xpGoalLevel, xpGoalCost, xpBurstStartExperience);
+        status = "Farming XP at the exp spot: level " + player.getLevel() + " / goal " + xpGoalLevel
+            + " (anvil cost " + xpGoalCost + ")";
+        info("[trace] XP farm started: level {} -> goal {} (anvil cost {})",
+            player.getLevel(), xpGoalLevel, xpGoalCost);
         return true;
-    }
-
-    /** Burst length as a short human-readable string, e.g. {@code 5.0s}. */
-    private String burstText() {
-        return String.format(java.util.Locale.ROOT, "%.1fs", xpBurstMs() / 1000.0);
     }
 
     /**
@@ -1191,24 +1297,22 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
-     * Stops the XP goal bookkeeping, including a burst that is still running. The callers switch the aura, since only
-     * they know whether the level is enough; everything that identifies the burst is cleared here so the next burst
+     * Stops the XP goal bookkeeping, including a farm that is still running. The callers switch the aura, since only
+     * they know whether the level is enough; everything that identifies the farm is cleared here so the next one
      * starts from a clean slate.
      */
     private void stopXpFarming() {
         xpFarmingActive = false;
         killSpotPath = null;
         killSpotAttempts = 0;
-        xpBurstStartedAt = 0;
-        xpBurstStartExperience = 0;
     }
 
     /**
-     * Writes the BOT's own KillAura setting, exactly like the reference enchant plugin: an on/off switch driven only by
-     * "does the anvil cost more level than the BOT has". While the farm runs the aura is on; as soon as the level is
-     * affordable it is switched off again, so the BOT never keeps fighting while it has enchanting work to do.
+     * Writes the BOT's own KillAura setting. Two things drive it: the XP gate ("does the anvil cost more level than the
+     * BOT has") and the kill windows that keep the silverfish farm from being culled while the BOT works. It is never
+     * left on for its own sake - every window switches it off again.
      *
-     * <p>The user's own value is remembered the first time the farm touches the setting and handed back by
+     * <p>The user's own value is remembered the first time the module touches the setting and handed back by
      * {@link #releaseKillAura()} when the module stops.
      */
     private synchronized void switchKillAura(boolean enabled) {
@@ -1221,7 +1325,7 @@ public class AutoEnchantModule extends Module {
         KillAura killAura = MODULE.get(KillAura.class);
         if (killAura != null) killAura.syncEnabledFromConfig();
         info("[trace] KillAura switched {}: {}", enabled ? "on" : "off",
-            enabled ? "farming XP for the anvil" : "the anvil cost is affordable");
+            enabled ? "killing silverfish at the exp spot" : "back to the enchant work");
     }
 
     /** Hands the user's own KillAura setting back when this module stops driving it. */
@@ -1236,15 +1340,18 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
-     * Decides from the cost the anvil is showing whether the BOT has to go and farm XP. Nothing else enables KillAura:
-     * a free or an affordable operation switches it off, and farming only starts for the exact level the window
-     * asks for (plus a small reserve so the next merge does not need a second trip).
+     * Decides whether the BOT has enough levels for the operation in front of it. Nothing else enables KillAura: a
+     * free or an affordable operation switches it off, and farming only starts for the level the plan asks for plus a
+     * small reserve.
      *
-     * <p>In {@code KILL} mode this is also what repeats the fight: one burst runs for {@link #xpBurstMs()}, stops, and
-     * the next call of this method - from {@link #waitForExperience()} - starts another burst only when the level is
-     * still short.
+     * <p>The cost normally comes from the plan ({@link #plannedCostOf(int)}), so the level is farmed <em>before</em>
+     * the anvil is opened; the anvil's own "cost N levels" line is then only a verification, which is what the calls
+     * from {@code verifyAnvilPreview} do.
      *
-     * @param requiredLevel the level cost reported by the open anvil, i.e. the "cost N levels" line in the GUI
+     * <p>In {@code KILL} mode the farm is continuous - the BOT stands at the exp spot the whole time - so this method
+     * is a level gate, not a fight scheduler.
+     *
+     * @param requiredLevel the level cost, from the plan or from the open anvil window
      * @return true when the BOT may take the result now
      */
     public boolean ensureXpForCost(int requiredLevel) {
@@ -1256,29 +1363,24 @@ public class AutoEnchantModule extends Module {
             finishXp("the operation is free");
             return true;
         }
-        // The level that pays for this operation right now...
-        int affordable = cost + RESERVE_LEVELS;
-        // ...and the level the farm keeps fighting for. KILL mode banks a few extra levels so a merge that becomes
-        // affordable mid-fight does not stop the farm at once; the next call only has to walk back to the anvil.
-        int goal = affordable + xpAccumulateLevels();
-        // A different operation means a different goal: its own farm budget, its own burst counter.
+        // The level that pays for this operation right now, plus a couple of levels so the next merge is not blocked
+        // on the exact same level it just spent.
+        int goal = cost + RESERVE_LEVELS;
+        // A different operation means a different goal: its own farm budget.
         if (xpGoalLevel != goal || xpGoalCost != cost) {
             xpFarmStartedAt = 0;
-            xpBurstsWithoutProgress = 0;
         }
         xpGoalLevel = goal;
         xpGoalCost = cost;
         boolean windowOpen = CACHE.getPlayerCache().getInventoryCache().getOpenContainerId() != 0;
-        // With the window open the result is taken as soon as the cost is covered: extra levels are only accumulated
-        // between bursts, while the BOT fights with both hands free.
-        if (player.getLevel() >= (windowOpen ? affordable : goal)) {
+        if (player.getLevel() >= goal) {
             finishXp("level " + player.getLevel() + " covers the anvil cost " + cost);
             return true;
         }
-        // Fight only with both hands free: while the anvil window is open the state machine is about to close it, and a path
+        // Fight only with both hands free: while a window is open the state machine is about to close it, and a path
         // request submitted under an open GUI is rejected by the server.
         if (windowOpen) {
-            status = "Anvil needs " + cost + " levels; closing it before farming XP";
+            status = "Anvil needs " + cost + " levels (level " + player.getLevel() + "); closing it before farming XP";
             return false;
         }
         var source = AutoEnchantPlugin.PLUGIN_CONFIG.experienceSource;
@@ -1290,15 +1392,15 @@ public class AutoEnchantModule extends Module {
         }
         if (source == AutoEnchantConfig.ExperienceSource.EXP) {
             // EXP is not a fight: the proxy's own XP feature has to deliver the level, so the BOT just waits here.
-            // KillAura is never switched on in this mode (see startXpBurst).
+            // KillAura is never switched on in this mode (see startFarming).
             status = "Waiting for XP: level " + player.getLevel() + " -> " + goal + " (anvil cost " + cost + ")";
             return false;
         }
-        // Whether the BOT can farm at all is decided inside startXpBurst; walking to the spot is not a failure.
-        if (!xpFarmingActive) startXpBurst();
+        // Whether the BOT can farm at all is decided inside startFarming; walking to the spot is not a failure.
+        if (!xpFarmingActive) startFarming();
         if (xpFarmingActive) {
             status = "Farming XP for the anvil: level " + player.getLevel() + " -> " + goal
-                + " (" + burstText() + " per burst, anvil cost " + cost + ")";
+                + " (anvil cost " + cost + ")";
         }
         return false;
     }
@@ -1310,12 +1412,9 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
-     * Watches the running burst. A burst is a short fight, so this stops it on three signals: the level is now enough
-     * (the whole farm is over), the burst's time is up (stop and let the caller re-check the cost), or something went
-     * wrong (dead, hurt, teleported, out of time).
-     *
-     * <p>Stopping the aura at the end of a burst is the point of splitting the farm into bursts: the level is only
-     * read between fights, so the BOT never keeps hitting mobs for XP it can already spend.
+     * Watches the running farm. The level reaching the goal ends it; a death, a bad dimension and a teleport end it
+     * as a failure; two budgets keep a dead spot from parking the workflow: a hard ceiling for the whole goal, and a
+     * short "no level gained at all" window that catches a spot without silverfish or an aura that never swings.
      */
     private void monitorXpFarming() {
         if (!xpFarmingActive) return;
@@ -1323,7 +1422,6 @@ public class AutoEnchantModule extends Module {
         if (player == null) { interruptXp("BOT player data unavailable"); return; }
         if (!player.isAlive()) { interruptXp("BOT died"); return; }
         if (player.getHealth() < MIN_HEALTH) { interruptXp("Health below " + (int) MIN_HEALTH); return; }
-        // Enough XP ends the whole farm, not just the burst: the next ensureXpForCost sees the affordable cost.
         if (xpGoalLevel > 0 && player.getLevel() >= xpGoalLevel) {
             finishXp("level " + player.getLevel() + " reaches the anvil cost goal " + xpGoalLevel);
             return;
@@ -1334,42 +1432,24 @@ public class AutoEnchantModule extends Module {
         xpLastX = player.getX(); xpLastY = player.getY(); xpLastZ = player.getZ();
         if (dx * dx + dy * dy + dz * dz > 16 * 16) { interruptXp("BOT was teleported during XP farming"); return; }
         long now = System.currentTimeMillis();
-        // Hard ceiling for the whole goal, whatever the individual bursts report.
+        // Hard ceiling for the whole goal.
         if (xpFarmStartedAt > 0 && now - xpFarmStartedAt > KILLAURA_MAX_SECONDS * 1000L) {
             interruptXp("XP farming ran " + KILLAURA_MAX_SECONDS + "s and level " + player.getLevel()
                 + " is still short of " + xpGoalLevel);
             return;
         }
-        if (now - xpBurstStartedAt < xpBurstMs()) return;
-        endXpBurst(player.getLevel(), player.getTotalExperience());
+        // Not a single level in this many seconds means the farm is empty or the aura is not landing hits: say so
+        // instead of standing there for the full ceiling.
+        if (xpFarmStartedAt > 0 && now - xpFarmStartedAt > NO_XP_PROGRESS_MS
+            && player.getLevel() <= xpFarmStartLevel) {
+            interruptXp("no level gained at the exp spot in " + (NO_XP_PROGRESS_MS / 1000) + "s (still level "
+                + player.getLevel() + ")");
+        }
     }
 
     /**
-     * Ends one burst: KillAura off, progress recorded. The caller re-checks the anvil cost on the next tick, so a
-     * still-short level simply starts the next burst and a sufficient one ends the farm.
-     */
-    private void endXpBurst(int level, int totalExperience) {
-        int gained = totalExperience - xpBurstStartExperience;
-        if (gained > 0) {
-            xpBurstsWithoutProgress = 0;
-        } else {
-            xpBurstsWithoutProgress++;
-        }
-        stopXpFarming();
-        switchKillAura(false);
-        if (xpBurstsWithoutProgress >= MAX_EMPTY_XP_BURSTS) {
-            interruptXp(xpBurstsWithoutProgress + " bursts in a row gained no XP at the kill spot");
-            return;
-        }
-        status = "XP burst over: level " + level + " / goal " + xpGoalLevel
-            + " (+" + gained + " XP); checking the anvil cost";
-        info("[trace] XP burst over: level {} / goal {} (+{} XP, {} empty in a row)",
-            level, xpGoalLevel, gained, xpBurstsWithoutProgress);
-    }
-
-    /**
-     * Ends the whole XP goal because the level is no longer needed. The farm budget (burst counter, wall-clock start)
-     * is cleared so the next operation starts with a full budget.
+     * Ends the whole XP goal because the level is no longer needed, and clears the farm budget so the next operation
+     * starts with a fresh one.
      */
     private void finishXp(String reason) {
         boolean wasFarming = xpFarmingActive;
@@ -1379,7 +1459,6 @@ public class AutoEnchantModule extends Module {
         xpGoalLevel = -1;
         xpGoalCost = -1;
         xpFarmStartedAt = 0;
-        xpBurstsWithoutProgress = 0;
         if (!wasFarming) return;
         var player = CACHE.getPlayerCache().getThePlayer();
         status = "XP ready: " + reason;
@@ -1396,7 +1475,6 @@ public class AutoEnchantModule extends Module {
         xpGoalLevel = -1;
         xpGoalCost = -1;
         xpFarmStartedAt = 0;
-        xpBurstsWithoutProgress = 0;
         status = "XP farming interrupted: " + reason;
         if (wasFarming) warn("Auto-enchant XP farming interrupted: {}", reason);
     }
@@ -1430,6 +1508,8 @@ public class AutoEnchantModule extends Module {
         STORE_DEPOSIT,
         STORE_AWAIT_DEPOSIT,
         READY_NEXT_ENCHANT,
+        /** One piece is done but its batch is not: leave the finished product in the bag and pick up the next piece. */
+        BATCH_NEXT_PIECE,
         POST_ENCHANT,
         POST_ENCHANT_INPUT_GO_TO,
         POST_ENCHANT_INPUT_DEPOSIT,
@@ -1451,13 +1531,13 @@ public class AutoEnchantModule extends Module {
         GRINDSTONE_CLOSE,
         NEXT_BOOK,
         RESTOCK_ENCHANTED_BOOK_WITHDRAW,
-        RESTOCK_ENCHANTED_BOOK_TAKE,
         RESTOCK_ENCHANTED_BOOK_CLOSE,
         RESTOCK_ANVIL_TAKE,
         CLOSE_SUPPLY,
         PLACE_RENAME,
         CLOSE_FOR_XP,
         WAIT_XP,
+        KILL_WINDOW,
         TAKE_RESULT,
         VERIFY_RESULT,
         CLOSE_ANVIL,
@@ -1571,6 +1651,21 @@ public class AutoEnchantModule extends Module {
     private List<EnchantPresetCatalog.Enchant> books = List.of();
     private int operationIndex;
     private int bookIndex;
+
+    /** One book type of a withdrawal campaign: how many copies to top the bag up to. */
+    private record BookFetch(EnchantPresetCatalog.Enchant book, int want) { }
+
+    /**
+     * Book types the running campaign still has to visit. The campaign withdraws the whole plan's books in one pass -
+     * one window per chest, N copies per type - so the merge phase never stops in the middle of a piece to reopen a
+     * book chest.
+     */
+    private final List<BookFetch> fetchQueue = new ArrayList<>();
+    private int fetchIndex;
+    /** Carried copies of the current fetch entry when its window was opened, to measure what the clicks moved. */
+    private long fetchBefore;
+    /** Types whose chest was empty; they are not reopened in this transaction, the same chest is waited on instead. */
+    private final Set<EnchantPresetCatalog.Enchant> fetchEmpty = new java.util.LinkedHashSet<>();
     private int activeContainerId;
     private int sourceSlot = -1;
     private int playerSlot = -1;
@@ -1620,6 +1715,12 @@ public class AutoEnchantModule extends Module {
      * and every book withdrawal bounces off it and the item is retried forever instead of being unloaded.
      */
     private boolean flushing;
+    /**
+     * True while surplus raw input pieces are being returned to the input chest to free bag space. A batch over-fill
+     * (raw swords that were withdrawn before the finished ones counted towards the batch) leaves no finished product
+     * for {@link #flushing} to unload; the raw pieces have no work invested, so the safe exit is to put them back.
+     */
+    private boolean returningExcessInput;
     /** Free player slots a transaction wants: the equipment piece itself, one book, and the anvil result. */
     private static final int FREE_SLOTS_FOR_TRANSACTION = 3;
     /**
@@ -1662,9 +1763,34 @@ public class AutoEnchantModule extends Module {
      * piece taken directly from the chest, including the grindstone decision. The counter is consumed per adoption.
      */
     private final Map<String, Integer> restockBatch = new HashMap<>();
+    /**
+     * The job whose batch is currently open. Non-null from the moment a batch is recorded (pieces fetched from the
+     * chest, or unfinished pieces already in the bag) until every piece of it has been enchanted and unloaded. While
+     * it is set {@code beginInput} only resumes pieces of this job: no new fetch and no job rotation until the batch
+     * is finished to the last piece.
+     */
+    private AutoEnchantConfig.Enchant batchJob;
+    /** Recorded size of the open batch (raw + half-done + finished); drives the whole-batch book campaign. */
+    private int batchPieces;
+    /** Whether the current piece came from a batch still waiting in the bag (then the job must not rotate yet). */
+    private boolean itemFromRestockBatch;
+    /**
+     * The current unload deposits every finished product of the job at once instead of just this transaction's piece.
+     * Set on the last piece of a batch; a normal single-piece unload stays identity-scoped.
+     */
+    private boolean batchUnload;
     /** Item id and carried-stack count captured before a restock withdrawal, used to size the batch. */
     private int restockItemId = -1;
     private int restockBefore;
+    /**
+     * Containers whose block has actually disappeared (someone took the shulker box / barrel away), with the time
+     * until the next check and the number of consecutive misses. Unlike an empty chest this cannot be fixed by
+     * walking up to it again, so the branch is parked instead of re-clicking air dozens of times per second.
+     */
+    private final Map<BlockPos, Long> missingContainerUntil = new HashMap<>();
+    private final Map<BlockPos, Integer> missingContainerMisses = new HashMap<>();
+    private static final long MISSING_CONTAINER_MIN_MS = 2_000L;
+    private static final long MISSING_CONTAINER_MAX_MS = 30_000L;
     private static final int MAX_ITEM_ATTEMPTS = 3;
     private static final long SKIP_COOLDOWN_MS = 300_000L;
     /** When the current enchantItem was picked up, for the Discord completion log. */
@@ -1718,6 +1844,8 @@ public class AutoEnchantModule extends Module {
             int openedId = openContainerId();
             if (openedId != 0 && openedId != activeContainerId) {
                 activeContainerId = openedId;
+                // A window really opened here, so the box is back (or was never gone): drop any backoff.
+                clearMissingContainer(openingPosition);
                 clearOpenPathFuture();
                 waitForInteractTimer.reset();
             } else if (path != null && !path.isCompleted()) {
@@ -1749,9 +1877,17 @@ public class AutoEnchantModule extends Module {
         }
         try {
             switch (state) {
-                case ENTRYPOINT, NEXT_ENCHANT -> beginInput();
+                case ENTRYPOINT, NEXT_ENCHANT -> {
+                    // A due kill window runs before the next piece is fetched: a long run of container work must never
+                    // leave the silverfish farm untouched for the nine seconds after which the server culls a mob.
+                    if (killWindowDue() && openContainerId() == 0 && target == null && beginKillWindow(state)) {
+                        return;
+                    }
+                    beginInput();
+                }
                 case EVAL_RESTOCK -> evalRestock();
                 case READY_NEXT_ENCHANT -> completeTransaction();
+                case BATCH_NEXT_PIECE -> batchNextPiece();
                 case AWAIT_RESTOCK -> { if (waitForRestockTimer.tick(restockWaitTicks)) state = State.ENTRYPOINT; }
                 case RESTOCK_INPUT_GO_TO_CHEST, RESTOCK_ENCHANTED_BOOK_GO_TO_CHEST, GRINDSTONE_GO_TO_CHEST, ENCHANT_INTERACT_WITH_ANVIL, STORE_GO_TO_CHEST, RESTOCK_ANVIL_GO_TO_CHEST, POST_ENCHANT_INPUT_GO_TO, POST_ENCHANT_OVERFLOW_GO_TO -> beginOpen();
                 case RESTOCK_INPUT_WITHDRAW -> handleInputWindow();
@@ -1767,7 +1903,6 @@ public class AutoEnchantModule extends Module {
                 case GRINDSTONE_CLOSE -> closeContainer(State.NEXT_BOOK);
                 case NEXT_BOOK -> nextBook();
                 case RESTOCK_ENCHANTED_BOOK_WITHDRAW -> handleBookWindow();
-                case RESTOCK_ENCHANTED_BOOK_TAKE -> takeBook();
                 case RESTOCK_ENCHANTED_BOOK__AWAIT_WITHDRAW -> verifyBookTransfer();
                 case RESTOCK_ENCHANTED_BOOK_CLOSE -> closeContainer(State.NEXT_BOOK);
                 case ENCHANT_AWAIT_INTERACT_WITH_ANVIL -> handleAnvilWindow();
@@ -1776,12 +1911,13 @@ public class AutoEnchantModule extends Module {
                 case AWAIT_ENCHANT -> verifyAnvilPreview();
                 case CLOSE_FOR_XP -> closeContainer(State.WAIT_XP);
                 case WAIT_XP -> waitForExperience();
+                case KILL_WINDOW -> tickKillWindow();
                 case TAKE_RESULT -> takeAnvilResult();
                 case VERIFY_RESULT -> verifyAnvilResult();
                 case CLOSE_ANVIL -> closeContainer(failureReason != null ? State.POST_ENCHANT
                     : backToBooks ? State.NEXT_BOOK
                     : operationIndex >= operations.size()
-                        ? (needsRename() ? State.NEXT_BOOK : State.POST_ENCHANT)
+                        ? (needsRename() ? State.NEXT_BOOK : State.BATCH_NEXT_PIECE)
                         // A merge whose books are still in a chest is fetched first: opening the anvil for it only
                         // produces the "input not found" round trip. Everything else re-checks the station, because
                         // the anvil can break between two merges.
@@ -1825,8 +1961,16 @@ public class AutoEnchantModule extends Module {
         }
         // A target enchantItem already in the BOT inventory is an interrupted transaction, not a fresh fetch: it is resumed
         // as-is and never reset, so work the BOT already paid for is kept.
-        int carried = findCarriedEquipment();
+        // A recorded batch owns the workflow until its last piece is done: resume only its pieces, never start a
+        // different job's fetch while its finished products are still waiting in the bag.
+        int carried = findCarriedEquipment(batchJob);
         if (carried >= 0) { adoptCarried(carried); return; }
+        if (batchJob != null) {
+            // No unfinished piece of the batch is left. Send its finished products to the unload chest together;
+            // if none are left either (dropped/failed piece), release the latch so the next batch can be fetched.
+            if (!beginBatchUnload()) closeBatch();
+            return;
+        }
         // Nothing of ours to resume, but the bag is too full to fetch another piece: unload finished products that are
         // still waiting in the inventory (the output container was full or its marker was missing at the time) so the
         // next cycle has room again. A full bag used to dead-end here: the withdraw click silently did nothing and the
@@ -1837,6 +1981,7 @@ public class AutoEnchantModule extends Module {
         int freeSlots = freeInventorySlots();
         if (freeSlots < 1) {
             if (flushFinishedProduct("no free slot left in the bag")) return;
+            if (flushExcessInput("no free slot left in the bag")) return;
             // Nothing unloadable is left in the bag. Opening the pickup chest would only bounce the withdraw click off
             // a full inventory, so the bag is reported and the branch runs again on the next tick.
             retryBranch("Bag is full: no free slot for the next enchantItem");
@@ -1918,14 +2063,22 @@ public class AutoEnchantModule extends Module {
      * most advanced piece wins: with several half-done swords in the bag, resuming the one closest to the target
      * spends the fewest levels, and the barely-started ones wait their turn instead of being picked first forever.
      */
-    private int findCarriedEquipment() {
+    private int findCarriedEquipment() { return findCarriedEquipment(null); }
+
+    /** Same ranking, optionally restricted to the recorded batch's job so no other job can steal its turn. */
+    private int findCarriedEquipment(AutoEnchantConfig.Enchant onlyJob) {
         int bestSlot = -1;
         int bestScore = -1;
         for (int slot = 9; slot <= 44; slot++) {
             ItemStack stack = playerItem(slot);
             if (stack == null) continue;
-            if (runnableJobFor(stack).isEmpty()) continue;
+            var job = runnableJobFor(stack);
+            if (job.isEmpty()) continue;
+            if (onlyJob != null && job.get() != onlyJob) continue;
             if (isCoolingDown(stack)) continue;
+            // A finished product waiting for the batch unload is not work: it has the highest progress score, so
+            // without this guard beginInput would pick it up again and replay a no-op transaction forever.
+            if (normalizedEnchants(stack).equals(targetEnchantsOf(job.get()))) continue;
             int score = progressScore(stack);
             if (score > bestScore) { bestScore = score; bestSlot = slot; }
         }
@@ -1947,12 +2100,16 @@ public class AutoEnchantModule extends Module {
         // A piece withdrawn together with the previous transaction is still a fresh chest item, so it gets the
         // same reset decision instead of being resumed as if the BOT had already worked on it.
         boolean fromRestock = consumeRestockBatch(stack);
+        itemFromRestockBatch = fromRestock;
         origin = fromRestock ? Origin.INPUT_CHEST : Origin.INVENTORY;
         playerSlot = slot;
         sourceSlot = -1;
         itemSnapshot = stack.clone();
         target = match.get();
         beginTransaction();
+        // Unfinished pieces already in the bag are part of the batch too: starting from one of them opens a batch
+        // that includes every other carried piece of the same job, so they are all finished before a new fetch.
+        openBatch(target);
         grindRequired = false;
         if (fromRestock && catalog().hasCurse(stack)) {
             failureReason = "Cursed enchantItem skipped";
@@ -2028,6 +2185,15 @@ public class AutoEnchantModule extends Module {
     private void beginOpen() {
         openState = state;
         if (openingPosition == null) { fail("No container/workstation position to open"); return; }
+        // A container that is no longer a block (the shulker box was taken) cannot be opened by walking up to it:
+        // Baritone would resolve "No block is at ..." in the same tick and reopenContainer would re-click forever.
+        if (isContainerOpenState(state) && containerGone(openingPosition)) {
+            reportMissingContainer(openingPosition, containerRole(state), "about to open " + openingPosition);
+            return;
+        }
+        // One kill window before a window is opened. Book and anvil work keeps the BOT behind a container for far
+        // longer than the silverfish farm tolerates, so the farm is cleared right before the pause, not after it.
+        if (killWindowDue() && openContainerId() == 0 && beginKillWindow(state)) return;
         if (openContainerId() != 0) {
             // The trader funnels every chest interaction through awaitContainerClosed: never stack
             // a station screen on a window that is already open, close it and retry OPEN_*.
@@ -2079,6 +2245,9 @@ public class AutoEnchantModule extends Module {
         }
         // Stay on the job that just delivered instead of re-probing the empty ones in front of it.
         enchantIterator.select(chosenTarget);
+        // This piece came out of the chest itself: it is the one that advances the job rotation when it is finished.
+        // The rest of its batch is adopted from the bag and must not rotate again (see completeTransaction).
+        itemFromRestockBatch = false;
         sourceSlot = selected;
         origin = Origin.INPUT_CHEST;
         itemSnapshot = chosen.clone();
@@ -2276,10 +2445,10 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
-     * Withdraws the current equipment piece plus, when the job asks for it, more pieces of the
-     * same equipment from the same chest in one inventory request. {@code inputItemRestockStacks}
-     * is the number of pieces taken per restock, so the following pieces are processed straight
-     * from the BOT inventory without reopening this chest.
+     * Withdraws the current equipment piece plus more of the same equipment from the same chest in one inventory
+     * request. The global {@code inputItemRestockStacks} is the batch size, so the following pieces are processed
+     * straight from the BOT inventory without reopening this chest, and the next job is not picked until they are all
+     * done.
      */
     private void takeInput() {
         // Never withdraw more pieces than the bag can take: the extra stacks of a batch are dropped on the ground by
@@ -2287,12 +2456,22 @@ public class AutoEnchantModule extends Module {
         int free = freeInventorySlots();
         if (free < 1) {
             if (flushFinishedProduct("no free slot for the withdrawal")) return;
+            if (flushExcessInput("no free slot for the withdrawal")) return;
             // No retry and no back-off: the window stays open and the same withdraw is tried again on the next tick,
             // once a finished product could be unloaded or the operator freed a slot.
             setWorkflowStatus("Bag is full: no free slot to take the withdrawal");
             return;
         }
-        int wanted = Math.max(1, Math.min(target.inputItemRestockStacks, free));
+        // Top the batch up instead of always taking four: half-done pieces already in the bag count towards the
+        // batch, so a bag holding two of them only withdraws two more. At least one is taken so the rotation and the
+        // "came from the chest" marker always have a piece to attach to.
+        int batchSize = Math.max(1, PLUGIN_CONFIG.inputItemRestockStacks);
+        // Count every carried piece of the batch, finished ones included: they still occupy a slot of the four until
+        // the whole batch is unloaded. Using the pending-only count here refilled one raw sword per finished piece.
+        int alreadyCarried = countCarriedBatchPieces();
+        int wanted = Math.max(1, Math.min(batchSize - alreadyCarried, free));
+        trace("pickup batch: {} piece(s) already carried, withdrawing {} more (batch size {})",
+            alreadyCarried, wanted, batchSize);
         restockItemId = configuredItemId();
         restockBefore = countCarriedById(restockItemId);
         List<com.zenith.feature.inventory.actions.InventoryAction> actions = new ArrayList<>(
@@ -2331,6 +2510,9 @@ public class AutoEnchantModule extends Module {
         int extra = withdrawn - 1; // the first piece is the current transaction
         String key = Integer.toString(restockItemId);
         if (extra > 0) restockBatch.put(key, extra); else restockBatch.remove(key);
+        // Record the batch itself: every piece of this job now in the bag - the ones just withdrawn and any
+        // unfinished ones already carried - belongs to it. Nothing new is fetched until all of them are done.
+        openBatch(target);
         restockItemId = -1;
         restockBefore = 0;
     }
@@ -2439,7 +2621,7 @@ public class AutoEnchantModule extends Module {
             // operationIndex keeps its progress because merges may run while books are still being restocked.
             if (operations.isEmpty() || operationIndex >= operations.size()) {
                 if (needsRename()) { beginRenamePass(); return; }
-                state = State.POST_ENCHANT;
+                state = State.BATCH_NEXT_PIECE;
                 return;
             }
             backToBooks = false;
@@ -2454,6 +2636,9 @@ public class AutoEnchantModule extends Module {
             state = State.CHECK_ANVIL;
             return;
         }
+        // Everything the plan still needs from the chests is withdrawn in one campaign before any merge starts: one
+        // window per type, copiesPerType books each, so a 4-piece batch costs 7 window openings instead of 28.
+        if (bookFetchStep()) return;
         EnchantPresetCatalog.Enchant book = books.get(bookIndex);
         long requiredCopies = books.subList(0, bookIndex + 1).stream().filter(book::equals).count();
         trace("need book {}/{}: {} {} (carried {}, required {})", bookIndex + 1, books.size(),
@@ -2473,12 +2658,22 @@ public class AutoEnchantModule extends Module {
             bookIndex++;
             return;
         }
+        // This chest was already found empty in this transaction: wait at it, exactly like the old single-book
+        // branch did, instead of reopening it every tick in a campaign that can no longer make progress.
+        if (fetchEmpty.contains(book)) {
+            var emptyChest = bookContainerPosition(book.id(), book.level());
+            if (emptyChest.isPresent()) openingPosition = emptyChest.get();
+            reenter(State.RESTOCK_ENCHANTED_BOOK_GO_TO_CHEST, "Book chest at " + openingPosition
+                + " holds no " + book.id() + " " + book.level());
+            return;
+        }
         if (!hasFreeInventorySlot()) {
             // Opening the chest only to have the shift-click bounce off a full inventory spins forever. A finished
             // product carried by the bag is unloaded first; only when there is nothing to unload is the transaction
             // parked with the reason (the item stays untouched in the inventory). A single free slot is enough here:
             // the merge that follows moves both inputs into the anvil and puts only the result back.
             if (flushFinishedProduct("no room for " + book.id() + " " + book.level())) return;
+            if (flushExcessInput("no room for " + book.id() + " " + book.level())) return;
             keepAndRetry("BOT inventory is full; no room for " + book.id() + " " + book.level());
             return;
         }
@@ -2494,37 +2689,170 @@ public class AutoEnchantModule extends Module {
         state = State.RESTOCK_ENCHANTED_BOOK_GO_TO_CHEST;
     }
 
+    /**
+     * One step of the book campaign: opens the chest of the next type still short, or returns false when the campaign
+     * is over (and the merge phase can start).
+     *
+     * @return true when this step took over the workflow; the caller then simply returns
+     */
+    private boolean bookFetchStep() {
+        if (fetchQueue.isEmpty() && !buildFetchQueue()) return false;
+        if (fetchIndex >= fetchQueue.size()) {
+            trace("book campaign finished: {} type(s) visited, {} book(s) carried",
+                fetchQueue.size(), books.stream().filter(b -> countBooks(b) > 0).count());
+            fetchQueue.clear();
+            fetchIndex = 0;
+            return false;
+        }
+        BookFetch next = fetchQueue.get(fetchIndex);
+        if (fetchEmpty.contains(next.book())) { fetchIndex++; return true; }
+        if (!hasFreeInventorySlot()) {
+            if (flushFinishedProduct("no room for " + next.book().id() + " " + next.book().level())) return true;
+            if (flushExcessInput("no room for " + next.book().id() + " " + next.book().level())) return true;
+            keepAndRetry("BOT inventory is full; no room for " + next.book().id() + " " + next.book().level());
+            return true;
+        }
+        var chest = bookContainerPosition(next.book().id(), next.book().level());
+        if (chest.isEmpty()) {
+            // A missing book marker is a supply problem, not a failed enchant: the type is skipped this round and the
+            // merge phase reports what is still missing.
+            trace("no book chest is bound for {} {}; skipping it in this campaign",
+                next.book().id(), next.book().level());
+            fetchIndex++;
+            return true;
+        }
+        openingPosition = chest.get();
+        trace("book campaign {}/{}: {} {} x{} from {}", fetchIndex + 1, fetchQueue.size(),
+            next.book().id(), next.book().level(), next.want(), openingPosition);
+        state = State.RESTOCK_ENCHANTED_BOOK_GO_TO_CHEST;
+        return true;
+    }
+
+    /**
+     * Builds the campaign from the whole batch, not just the piece currently in hand. Every carried piece of this job
+     * that still needs work is compared against the target set: a sword that already carries looting, unbreaking and
+     * sharpness only asks for the enchants it is missing (e.g. mending), while a blank one asks for all of them. The
+     * per-type total is then reduced by the books already in the bag - including merged intermediates - so a batch of
+     * four blank pieces withdraws four of each book and a batch of half-done pieces withdraws far fewer.
+     *
+     * @return true when at least one chest has something to fetch
+     */
+    private boolean buildFetchQueue() {
+        fetchQueue.clear();
+        fetchIndex = 0;
+        if (target == null || targetEnchants.isEmpty()) return false;
+        int batchSize = Math.max(1, PLUGIN_CONFIG.inputItemRestockStacks);
+        // A recorded batch can be larger than the nominal fetch size when unfinished pieces were already in the bag.
+        // Plan books for all of its pieces in one campaign instead of leaving the extras for a second campaign.
+        int cap = batchJob != null ? Math.max(batchSize, Math.max(batchPieces, countCarriedBatchPieces())) : batchSize;
+
+        // The pieces of this batch that still need enchanting. The one in hand is among them; other carried pieces
+        // join it up to the batch size. Finished products and cooling-down pieces create no demand.
+        List<Map<String, Integer>> pieces = new ArrayList<>();
+        for (int slot = 9; slot <= 44; slot++) {
+            ItemStack stack = playerItem(slot);
+            if (stack == null || stack.getId() != configuredItemId()) continue;
+            var job = runnableJobFor(stack);
+            if (job.isEmpty() || job.get() != target) continue;
+            if (isCoolingDown(stack)) continue;
+            Map<String, Integer> current = normalizedEnchants(stack);
+            if (current.equals(targetEnchants)) continue;
+            pieces.add(current);
+            if (pieces.size() >= cap) break;
+        }
+        if (pieces.isEmpty() && itemSnapshot != null) {
+            Map<String, Integer> current = new HashMap<>();
+            catalog().enchantments(itemSnapshot).forEach((id, lvl) -> current.put(EnchantPresetCatalog.shortId(id), lvl));
+            if (!current.equals(targetEnchants)) pieces.add(current);
+        }
+
+        Map<EnchantPresetCatalog.Enchant, Integer> want = new LinkedHashMap<>();
+        for (var entry : targetEnchants.entrySet()) {
+            String id = entry.getKey();
+            int level = entry.getValue();
+            int lacking = 0;
+            for (Map<String, Integer> current : pieces) {
+                if (current.getOrDefault(id, 0) < level) lacking++;
+            }
+            if (lacking <= 0) continue;
+            EnchantPresetCatalog.Enchant book = new EnchantPresetCatalog.Enchant(id, level);
+            int deficit = lacking - carriedBookCopies(book);
+            if (deficit > 0) want.put(book, deficit);
+        }
+        for (var entry : want.entrySet()) {
+            if (fetchEmpty.contains(entry.getKey())) continue;
+            fetchQueue.add(new BookFetch(entry.getKey(), entry.getValue()));
+        }
+        if (!fetchQueue.isEmpty()) {
+            trace("book campaign planned for {} piece(s): {} type(s), {} book(s) to withdraw",
+                pieces.size(), fetchQueue.size(), fetchQueue.stream().mapToInt(BookFetch::want).sum());
+        }
+        return !fetchQueue.isEmpty();
+    }
+
+    /** enchantments() keys can carry a namespace; the planner and target sets use the short registry id. */
+    private Map<String, Integer> normalizedEnchants(ItemStack stack) {
+        Map<String, Integer> result = new HashMap<>();
+        catalog().enchantments(stack).forEach((id, lvl) -> result.put(EnchantPresetCatalog.shortId(id), lvl));
+        return result;
+    }
+
+    /**
+     * Copies of one book already in the bag. Merged intermediates (e.g. sweeping + unbreaking in one book) carry
+     * several enchantments and satisfy one copy of each, so counting only single-enchant books would re-fetch them.
+     */
+    private int carriedBookCopies(EnchantPresetCatalog.Enchant book) {
+        String id = EnchantPresetCatalog.shortId(book.id());
+        int count = 0;
+        for (Map<String, Integer> set : availableEnchantSets()) {
+            Integer lvl = set.get(id);
+            if (lvl != null && lvl >= book.level()) count++;
+        }
+        return count;
+    }
+
     private void handleBookWindow() {
         if (!isStorageWindow()) { fail("Book marker position did not open a storage container"); return; }
-        EnchantPresetCatalog.Enchant required = books.get(bookIndex);
-        int selected = findBookInTop(required);
-        if (selected < 0) {
-            // Empty book chest: close the window and walk back up to the open branch. No retry counter and no
-            // back-off - the same chest is simply entered again on the next tick.
-            reenter(State.RESTOCK_ENCHANTED_BOOK_GO_TO_CHEST, "Book chest at " + openingPosition
-                + " holds no " + required.id() + " " + required.level());
-            return;
+        BookFetch fetch = fetchIndex < fetchQueue.size() ? fetchQueue.get(fetchIndex) : null;
+        EnchantPresetCatalog.Enchant required = fetch != null ? fetch.book() : books.get(bookIndex);
+        int want = fetch != null ? fetch.want() : 1;
+        List<Integer> slots = new ArrayList<>();
+        for (int slot = 0; slot < topSlots() && slots.size() < want; slot++) {
+            if (matchesBook(openContainer().getItemStack(slot), required)) slots.add(slot);
         }
-        trace("book chest slot {} holds {} (want {} {})", selected,
-            describeItem(openContainer().getItemStack(selected)), required.id(), required.level());
-        sourceSlot = selected;
-        state = State.RESTOCK_ENCHANTED_BOOK_TAKE;
-    }
-
-    private void takeBook() {
-        submit(new ShiftClick(openContainerId(), sourceSlot, ShiftClickItemAction.LEFT_CLICK), State.RESTOCK_ENCHANTED_BOOK__AWAIT_WITHDRAW);
-    }
-
-    private void verifyBookTransfer() {
-        EnchantPresetCatalog.Enchant book = books.get(bookIndex);
-        long requiredCopies = books.subList(0, bookIndex + 1).stream().filter(book::equals).count();
-        if (countBooks(book) >= requiredCopies) {
-            trace("book taken: {} {} now carried x{}", book.id(), book.level(), countBooks(book));
-            bookIndex++;
+        if (slots.isEmpty()) {
+            // Empty book chest: this type leaves the campaign and the same chest is waited on afterwards. No retry
+            // counter and no back-off.
+            fetchEmpty.add(required);
+            fetchIndex++;
+            trace("book chest at {} holds no {} {}; campaign skips it", openingPosition, required.id(), required.level());
             state = State.RESTOCK_ENCHANTED_BOOK_CLOSE;
             return;
         }
-        if (waitForActionTimer.tick(interactTimeoutTicks())) {
+        // Never take more than the bag can hold: the batch is bounded by free slots as well as by the type's deficit.
+        int budget = Math.max(1, freeInventorySlots());
+        List<Integer> take = slots.subList(0, Math.min(slots.size(), Math.min(want, budget)));
+        fetchBefore = countBooks(required);
+        sourceSlot = take.get(0);
+        List<com.zenith.feature.inventory.actions.InventoryAction> actions = new ArrayList<>();
+        for (int slot : take) actions.add(new ShiftClick(openContainerId(), slot, ShiftClickItemAction.LEFT_CLICK));
+        trace("book chest {}: taking x{} {} {} from slot(s) {}", openingPosition, take.size(),
+            required.id(), required.level(), take);
+        submitBurst(actions, State.RESTOCK_ENCHANTED_BOOK__AWAIT_WITHDRAW);
+    }
+
+    private void verifyBookTransfer() {
+        EnchantPresetCatalog.Enchant book = fetchIndex < fetchQueue.size()
+            ? fetchQueue.get(fetchIndex).book() : books.get(bookIndex);
+        long carried = countBooks(book);
+        if (carried > fetchBefore) {
+            trace("book(s) taken: {} {} carried x{} (+{})", book.id(), book.level(), carried, carried - fetchBefore);
+            fetchBefore = carried;
+            fetchIndex++;
+            state = State.RESTOCK_ENCHANTED_BOOK_CLOSE;
+            return;
+        }
+        if (waitForActionTimer.tick(resultTimeoutTicks())) {
             // A full inventory is the reason a shift-click silently does nothing; say so instead of "not transferred".
             keepAndRetry(hasFreeInventorySlot()
                 ? "Book was not transferred to BOT inventory"
@@ -2799,7 +3127,10 @@ public class AutoEnchantModule extends Module {
         // Not enough levels yet is a waiting condition, not a failure: the item keeps its progress and is resumed
         // once XP farming can start again (or a later cycle tries again).
         if (consumeXpInterruption()) { keepAndRetry("XP farming is unavailable right now"); return; }
-        if (ensureXpForCost(waitingCost)) state = State.CHECK_ANVIL;
+        // waitingCost is 0 when the gate was entered from the plan instead of from an anvil window; the planned cost of
+        // the next merge is then the number to farm for.
+        int cost = waitingCost > 0 ? waitingCost : plannedCostOf(operationIndex);
+        if (ensureXpForCost(cost)) state = State.CHECK_ANVIL;
     }
 
     /**
@@ -2974,12 +3305,13 @@ public class AutoEnchantModule extends Module {
     /**
      * Slots this window should store.
      *
-     * <p>The transaction item is picked by identity; a flush trip takes every carried stack of the same item whose
-     * enchantment set already equals the job's target, which also covers pieces that were renamed by an earlier pass.
+     * <p>A regular single-piece unload is picked by identity. A batch unload (or a low-space flush) sweeps every
+     * carried stack of the same job whose enchantment set already equals the target, so the whole batch leaves in one
+     * window; this also covers pieces renamed by an earlier pass.
      */
     private List<Integer> depositTargets() {
         List<Integer> slots = new ArrayList<>();
-        if (!flushing) {
+        if (!flushing && !batchUnload && !returningExcessInput) {
             playerSlot = findCurrentEquipment();
             if (playerSlot >= 0) slots.add(playerSlot);
             return slots;
@@ -2992,10 +3324,14 @@ public class AutoEnchantModule extends Module {
     private boolean isDepositTarget(ItemStack stack) {
         if (stack == null || itemSnapshot == null) return false;
         if (stack.getId() != itemSnapshot.getId()) return false;
-        if (!flushing) return sameStackIdentity(itemSnapshot, stack);
+        // A batch unload deposits every finished product of this job, not just this piece. A regular single-piece
+        // unload stays identity-scoped so an unrelated piece in the same slot is never swept into the chest.
+        if (!flushing && !batchUnload && !returningExcessInput) return sameStackIdentity(itemSnapshot, stack);
         // The same job, not merely the same item: two jobs can share an item type (and even a target set) while
         // pointing at different output chests, and a batch must never file one job's products into the other's chest.
         if (runnableJobFor(stack).orElse(null) != target) return false;
+        // A return trip takes every RAW piece of the job; a flush/batch unload takes every FINISHED piece.
+        if (returningExcessInput) return catalog().enchantments(stack).isEmpty();
         return catalog().enchantments(stack).equals(targetEnchants);
     }
 
@@ -3080,6 +3416,11 @@ public class AutoEnchantModule extends Module {
             // back to, and retrying the same chest would only bounce off it again.
             role = "output";
             goTo = State.STORE_GO_TO_CHEST;
+            output = containerPosition(target, role);
+        } else if (returningExcessInput) {
+            // Surplus raw pieces go back where they came from, not to the finished-product chest.
+            role = "input";
+            goTo = State.POST_ENCHANT_INPUT_GO_TO;
             output = containerPosition(target, role);
         }
         if (output.isEmpty()) {
@@ -3249,7 +3590,75 @@ public class AutoEnchantModule extends Module {
      * damaged) and finally breaks, and the position then holds plain air. Re-clicking it resolves in the same tick -
      * "No block is at ...", no path, no window - so a vanished station is recovered instead of re-clicked.
      */
+    /** Container-owning OPEN states; the anvil and grindstone stations are deliberately not in this set. */
+    private boolean isContainerOpenState(State from) {
+        return switch (from) {
+            case RESTOCK_INPUT_GO_TO_CHEST, RESTOCK_ENCHANTED_BOOK_GO_TO_CHEST, RESTOCK_ANVIL_GO_TO_CHEST,
+                 STORE_GO_TO_CHEST, POST_ENCHANT_INPUT_GO_TO, POST_ENCHANT_OVERFLOW_GO_TO -> true;
+            default -> false;
+        };
+    }
+
+    /** Human-readable role for a missing-container warning, taken from the state that wanted to open it. */
+    private String containerRole(State from) {
+        return switch (from) {
+            case RESTOCK_INPUT_GO_TO_CHEST, POST_ENCHANT_INPUT_GO_TO -> "pickup";
+            case RESTOCK_ENCHANTED_BOOK_GO_TO_CHEST -> "enchantment book";
+            case RESTOCK_ANVIL_GO_TO_CHEST -> "anvil supply";
+            case STORE_GO_TO_CHEST, POST_ENCHANT_OVERFLOW_GO_TO -> "unload";
+            default -> "storage";
+        };
+    }
+
+    /**
+     * True when the marker's chunk is loaded but no container block stands there. An unloaded chunk is "unknown" and
+     * must be walked to first, exactly like a broken anvil in an unloaded chunk.
+     */
+    private boolean containerGone(BlockPos pos) {
+        return pos != null && World.isChunkLoadedBlockPos(pos.x(), pos.z()) && !isContainerBlock(pos);
+    }
+
+    /**
+     * Someone removed a container the workflow depends on (usually the shulker box under the unload frame). The
+     * trader-style reopen has no attempt counter, so re-clicking air would spin at dozens of clicks per second for
+     * hours. Park this branch for a short, doubling backoff instead, say what is missing, and keep the carried
+     * piece in the bag: it is unloaded as soon as the box is put back.
+     */
+    private void reportMissingContainer(BlockPos pos, String role, String reason) {
+        long now = System.currentTimeMillis();
+        Long until = missingContainerUntil.get(pos);
+        if (until != null && now < until) {
+            // Already parked for this box: never extend the wait because a different branch (e.g. a flush for a full
+            // bag) walked back here in the meantime.
+            awaitRestockUntil(until);
+            state = State.AWAIT_RESTOCK;
+            return;
+        }
+        int misses = missingContainerMisses.merge(pos, 1, Integer::sum);
+        long backoff = Math.min(MISSING_CONTAINER_MAX_MS,
+            MISSING_CONTAINER_MIN_MS * (1L << Math.min(4, misses - 1)));
+        missingContainerUntil.put(pos, now + backoff);
+        String what = "The " + role + " container at " + pos + " is gone (" + blockNameAt(pos)
+            + " is there now); checking again in " + (backoff / 1000) + "s";
+        warn("Auto-enchant: {}{}", what, reason == null ? "" : " [" + reason + "]");
+        clearTransaction();
+        setWorkflowStatus(what);
+        awaitRestockUntil(now + backoff);
+        state = State.AWAIT_RESTOCK;
+    }
+
+    /** Forget a missing-container flag once a window actually opened at that position. */
+    private void clearMissingContainer(BlockPos pos) {
+        if (pos == null) return;
+        missingContainerUntil.remove(pos);
+        missingContainerMisses.remove(pos);
+    }
+
     private void reopenContainer(String reason) {
+        if (isContainerOpenState(openState) && openingPosition != null && containerGone(openingPosition)) {
+            reportMissingContainer(openingPosition, containerRole(openState), reason);
+            return;
+        }
         if (stationMissing()) {
             trace("{} no longer holds an anvil ({}); restoring the station", openingPosition, reason);
             anvilRecoveryAttempts = 0;
@@ -3409,6 +3818,15 @@ public class AutoEnchantModule extends Module {
                 return;
             }
             openingPosition = anvilPosition;
+            // The plan already knows what the next merge costs, so the level is farmed before the anvil is opened
+            // instead of opening it, seeing too little, closing it again and only then farming. The anvil's own cost
+            // line stays authoritative as a verification (see verifyAnvilPreview).
+            int planned = plannedCostOf(operationIndex);
+            if (planned > 0) waitingCost = planned;
+            if (planned > 0 && !ensureXpForCost(planned)) {
+                state = State.WAIT_XP;
+                return;
+            }
             state = State.ENCHANT_INTERACT_WITH_ANVIL;
             return;
         }
@@ -3505,34 +3923,94 @@ public class AutoEnchantModule extends Module {
     }
 
     private void waitForPlacement() {
+        // The world cache can lag behind a placement that the server already accepted, especially while a kill window
+        // is churning hundreds of entities. The block is the ground truth: keep polling it until the timer runs out
+        // rather than trusting a rejected pathing future that only means Baritone gave up on its approach.
         if (isAnvilBlock(anvilPosition)) {
             anvilRecoveryAttempts = 0;
             setWorkflowStatus("Anvil placed at " + anvilPosition);
             state = State.CHECK_ANVIL;
             return;
         }
-        if (anvilBlockCraftFuture.isCompleted() && !anvilBlockCraftFuture.isAccepted()) {
-            anvilPlacementFailed();
-            return;
-        }
         if (waitForInteractTimer.tick(interactTimeoutTicks())) anvilPlacementFailed();
     }
 
     /**
-     * A placement that did not happen. From the idle branch it is just a delay before the next attempt (nothing is in
-     * flight); mid-transaction the anvil recovery counter decides when the piece steps aside.
+     * A placement that did not land. Re-issue it in place while an anvil remains in the bag: a failed placement is a
+     * station problem, not a failed enchant, so it must never park the transaction and send the piece back through
+     * NEXT_ENCHANT (where the next kill window interrupts the very placement being retried). Once the spare anvils run
+     * out, fall back to the idle branch's delayed retry, which walks to the supply chest if one is bound.
      */
     private void anvilPlacementFailed() {
         anvilBlockCraftFuture = RequestFuture.rejected;
-        if (stationRecoveryOnly) {
-            stationRecoveryOnly = false;
-            setWorkflowStatus("Could not place an anvil at " + anvilPosition + "; trying again after the restart delay");
-            awaitRestockUntil(System.currentTimeMillis()
-                + Math.max(500L, PLUGIN_CONFIG.restartDelay * 50L));
-            state = State.AWAIT_RESTOCK;
+        if (countStacks(ItemRegistry.ANVIL) > 0 && anvilRecoveryAttempts < MAX_ANVIL_RECOVERY) {
+            anvilRecoveryAttempts++;
+            trace("anvil did not appear after placement; re-placing from the bag ({}/{})",
+                anvilRecoveryAttempts, MAX_ANVIL_RECOVERY);
+            setWorkflowStatus("Anvil at " + anvilPosition + " did not settle; re-placing ("
+                + anvilRecoveryAttempts + "/" + MAX_ANVIL_RECOVERY + ")");
+            state = State.CRAFT_ANVIL_BLOCKS;
             return;
         }
-        fail("Could not place an anvil at " + anvilPosition);
+        stationRecoveryOnly = false;
+        // A fresh budget on the next visit: a placement that keeps failing must stay retryable from the idle branch,
+        // otherwise the exhausted counter would pin the workflow in AWAIT_RESTOCK forever.
+        anvilRecoveryAttempts = 0;
+        setWorkflowStatus("Could not place an anvil at " + anvilPosition + "; trying again after the restart delay");
+        awaitRestockUntil(System.currentTimeMillis() + Math.max(500L, PLUGIN_CONFIG.restartDelay * 50L));
+        state = State.AWAIT_RESTOCK;
+    }
+
+    /**
+     * Frees a jammed bag by returning surplus RAW input pieces to the input chest they came from. Unlike a finished
+     * product (which goes to the output chest via {@link #flushFinishedProduct}), a raw piece has no work invested,
+     * so sending it back is safe and lets the next book fetch proceed. Only the excess beyond one batch is touched;
+     * half-done and finished pieces are never taken by this route.
+     *
+     * @return true when a return trip was started and the caller must stop its own step
+     */
+    private boolean flushExcessInput(String reason) {
+        if (target == null || returningExcessInput || flushing) return false;
+        if (containerPosition(target, "input").isEmpty()) return false;
+        List<Integer> raw = new ArrayList<>();
+        for (int slot = 9; slot <= 44; slot++) {
+            ItemStack stack = playerItem(slot);
+            if (stack == null || stack.getId() != configuredItemId()) continue;
+            var job = runnableJobFor(stack);
+            if (job.isEmpty() || job.get() != target) continue;
+            if (catalog().hasCurse(stack)) continue;
+            if (catalog().enchantments(stack).isEmpty()) raw.add(slot);
+        }
+        // Keep one batch of raw pieces; only the surplus is safe to send back. With a healthy bag nothing is surplus
+        // and this path is a no-op - the over-filled bag is the only thing that reaches it.
+        if (raw.size() <= Math.max(1, PLUGIN_CONFIG.inputItemRestockStacks)) return false;
+        int slot = raw.getFirst();
+        ItemStack stack = playerItem(slot);
+        playerSlot = slot;
+        sourceSlot = -1;
+        itemSnapshot = stack.clone();
+        operations = List.of();
+        books = List.of();
+        operationIndex = 0;
+        bookIndex = 0;
+        origin = Origin.INVENTORY;
+        grindRequired = false;
+        failureReason = null;
+        renamePass = false;
+        backToBooks = false;
+        outputStored = false;
+        returningExcessInput = true;
+        batchUnload = false;
+        depositSlots = List.of();
+        depositRetries = 0;
+        waitForRestockTimer.reset();
+        beginTransaction();
+        trace("bag low on space ({}); returning {} surplus raw {} to the input chest to free slots",
+            reason, raw.size(), describeItem(stack));
+        setWorkflowStatus("Bag is over-filled with raw input; returning " + raw.size()
+            + " surplus " + describeItem(stack) + " to the input chest");
+        state = State.POST_ENCHANT;
+        return true;
     }
 
     private BlockPos firstAnvil() {
@@ -3567,6 +4045,110 @@ public class AutoEnchantModule extends Module {
         return stacks;
     }
 
+    /**
+     * Pieces of the current job still waiting to be enchanted in the bag. They count towards the batch so the pickup
+     * withdraws only the difference: a bag already holding two half-done swords tops up with two, not four more.
+     * Finished products, cooling-down pieces and cursed pieces do not count.
+     */
+    private int countPendingPieces() {
+        if (target == null) return 0;
+        int count = 0;
+        for (int slot = 9; slot <= 44; slot++) {
+            ItemStack stack = playerItem(slot);
+            if (stack == null || stack.getId() != configuredItemId()) continue;
+            var job = runnableJobFor(stack);
+            if (job.isEmpty() || job.get() != target) continue;
+            if (isCoolingDown(stack) || catalog().hasCurse(stack)) continue;
+            if (normalizedEnchants(stack).equals(targetEnchants)) continue;
+            count++;
+        }
+        return count;
+    }
+
+    /**
+     * Slots occupied by this job's batch: raw, half-done AND finished pieces. Restock sizes itself from this count,
+     * not from {@link #countPendingPieces()}: a finished piece is still one of the batch's four slots until the whole
+     * batch is unloaded together. Counting only pending pieces made every finished piece look like a free slot, so
+     * one raw sword was withdrawn per piece enchanted and the bag filled with 26 raw swords before any batch unloaded.
+     */
+    private int countCarriedBatchPieces() {
+        if (target == null) return 0;
+        int count = 0;
+        for (int slot = 9; slot <= 44; slot++) {
+            ItemStack stack = playerItem(slot);
+            if (stack == null || stack.getId() != configuredItemId()) continue;
+            var job = runnableJobFor(stack);
+            if (job.isEmpty() || job.get() != target) continue;
+            if (isCoolingDown(stack) || catalog().hasCurse(stack)) continue;
+            count++;
+        }
+        return count;
+    }
+
+    /**
+     * Records the batch from the pieces of {@code job} currently in the bag. Call after {@code target} is set, since
+     * the batch counter is scoped to that job.
+     */
+    private void openBatch(AutoEnchantConfig.Enchant job) {
+        if (job == null || batchJob == job) return;
+        batchJob = job;
+        batchPieces = countCarriedBatchPieces();
+        trace("batch recorded: {} piece(s) of {} in the bag; no new input until they are all enchanted and unloaded",
+            batchPieces, job.displayName());
+    }
+
+    /** Releases the batch latch once every piece of it has left the inventory. */
+    private void closeBatch() {
+        if (batchJob == null) return;
+        trace("batch released: {} piece(s) of {} finished and unloaded", batchPieces, batchJob.displayName());
+        batchJob = null;
+        batchPieces = 0;
+    }
+
+    /**
+     * Safety net for a recorded batch with no unfinished piece left (the last piece failed permanently, was parked,
+     * or was dropped): unload every finished product of the batch together instead of leaving the latch stuck.
+     *
+     * @return true when an unload trip was started
+     */
+    private boolean beginBatchUnload() {
+        if (batchJob == null || openContainerId() != 0) return false;
+        Map<String, Integer> wanted = targetEnchantsOf(batchJob);
+        if (wanted.isEmpty()) return false;
+        List<Integer> finished = new ArrayList<>();
+        for (int slot = 9; slot <= 44; slot++) {
+            ItemStack stack = playerItem(slot);
+            if (stack == null || runnableJobFor(stack).orElse(null) != batchJob) continue;
+            if (!catalog().enchantments(stack).equals(wanted)) continue;
+            finished.add(slot);
+        }
+        if (finished.isEmpty()) return false;
+        target = batchJob;
+        targetEnchants = wanted;
+        playerSlot = finished.getFirst();
+        itemSnapshot = playerItem(playerSlot).clone();
+        sourceSlot = -1;
+        origin = Origin.INVENTORY;
+        operations = List.of();
+        books = List.of();
+        operationIndex = 0;
+        bookIndex = 0;
+        failureReason = null;
+        grindRequired = false;
+        renamePass = false;
+        backToBooks = false;
+        outputStored = false;
+        flushing = false;
+        returningExcessInput = false;
+        batchUnload = true;
+        depositSlots = List.of();
+        depositRetries = 0;
+        beginTransaction();
+        trace("batch unload: depositing {} finished piece(s) of {} together", finished.size(), batchJob.displayName());
+        state = State.POST_ENCHANT;
+        return true;
+    }
+
     private int findAnvilInTop() {
         for (int slot = 0; slot < topSlots(); slot++) {
             ItemStack stack = openContainer().getItemStack(slot);
@@ -3576,6 +4158,21 @@ public class AutoEnchantModule extends Module {
     }
 
     private void submit(com.zenith.feature.inventory.actions.InventoryAction action, State after) { submit(List.of(action), after); }
+
+    /**
+     * A click rejected by the inventory queue is a busy queue, not a failed enchant. Calling {@link #fail(String)}
+     * here used to recurse: fail -> keepAndRetry -> closeContainer -> submit -> fail ... until the stack overflowed,
+     * with every frame trying to close the same window. Park the click for one retry delay instead.
+     */
+    private void parkBusyInventoryQueue() {
+        clearActionFuture();
+        trace("inventory queue is busy; parking the click instead of recursing");
+        retryReason = "Inventory action queue is busy";
+        awaitRestockUntil(System.currentTimeMillis() + retryDelayMs());
+        // Deliberately no closeContainer here: that submits another click and would re-enter this same method.
+        // BACKOFF -> READY_NEXT_ENCHANT -> beginInput closes any still-open window before the next real click.
+        state = State.BACKOFF;
+    }
 
     /**
      * Priority used for every chest/anvil click: the module's own, which sits above KillAura and Baritone (see
@@ -3596,7 +4193,7 @@ public class AutoEnchantModule extends Module {
         afterInventoryState = after;
         attachActionFuture(after, future);
         waitForActionTimer.reset();
-        if (future == RequestFuture.rejected) { clearActionFuture(); fail("Inventory action queue is busy"); }
+        if (future == RequestFuture.rejected) parkBusyInventoryQueue();
     }
 
     /**
@@ -3612,32 +4209,72 @@ public class AutoEnchantModule extends Module {
         afterInventoryState = after;
         attachActionFuture(after, future);
         waitForActionTimer.reset();
-        if (future == RequestFuture.rejected) { clearActionFuture(); fail("Inventory action queue is busy"); }
+        if (future == RequestFuture.rejected) parkBusyInventoryQueue();
+    }
+
+    /**
+     * One piece of the batch is fully enchanted. The finished product stays in the bag while sibling pieces of the
+     * same job still need work, so the whole batch can be unloaded in a single trip instead of one chest visit per
+     * piece. Only the last piece of the batch opens the unload container.
+     */
+    private void batchNextPiece() {
+        if (openContainerId() != 0) { closeContainer(State.BATCH_NEXT_PIECE); return; }
+        int pending = countPendingPieces();
+        if (pending > 0) {
+            // Not the last piece: log this piece as done, keep the product in the bag, and let beginInput adopt the
+            // next carried piece. The job cursor must not rotate here - the whole batch belongs to this job.
+            logTransaction(true);
+            retryReason = null;
+            clearTransaction();
+            itemAttempts.clear();
+            transientRetries = 0;
+            flushTrips = 0;
+            trace("batch: finished piece kept in bag, {} piece(s) of this job still pending", pending);
+            setWorkflowStatus("Batch: piece done, continuing with the next carried piece");
+            state = State.NEXT_ENCHANT;
+            return;
+        }
+        // Last piece of the batch: unload every finished product of this job together.
+        batchUnload = true;
+        trace("batch complete: unloading all finished products of {} together",
+            target == null ? "this job" : target.displayName());
+        state = State.POST_ENCHANT;
     }
 
     private void completeTransaction() {
         // Attempt counters survive a failed round so a repeatedly failing enchantItem eventually gets parked. A round
         // only counts as a success once the item really left the inventory: a parked retry is not a success, otherwise
         // the counter would be zeroed on every loop and the item would retry forever.
-        boolean succeeded = outputStored && failureReason == null && !flushing;
+        boolean maintenance = flushing || returningExcessInput;
+        boolean succeeded = outputStored && failureReason == null && !maintenance;
         // Log only real endings: a stored enchantItem or a failed one. A transient step failure keeps the
-        // enchantItem in the inventory and is retried silently instead of spamming Discord. A flush is neither: it only
-        // freed a slot, so it gets a trace line instead of an "Enchant Completed" embed.
+        // enchantItem in the inventory and is retried silently instead of spamming Discord. A flush or an excess-input
+        // return is neither: it only freed a slot, so it gets a trace line instead of an "Enchant Completed" embed.
         if (retryReason != null) trace("transaction parked for a retry: {} (retries={})", retryReason, transientRetries);
         if (flushing) trace("flush finished: bag space freed, back to the enchant queue");
+        if (returningExcessInput) trace("excess raw input returned: bag space freed, back to the enchant queue");
         trace("transaction timings: reset {}s, anvil {}s, carried inputs {} -> {}, finished outputs {}",
             secondsSince(unchantStartTime), secondsSince(enchantStartTime),
             preEnchantInputCount, target == null ? 0 : countCarriedById(configuredItemId()), preEnchantOutputCount);
-        if ((outputStored || failureReason != null) && !flushing) logTransaction(succeeded);
+        if ((outputStored || failureReason != null) && !maintenance) logTransaction(succeeded);
+        // Rotate once when a whole batch has been unloaded (the last piece came from the bag, so the old
+        // itemFromRestockBatch rule would wrongly skip it), otherwise keep the previous single-piece behaviour.
+        boolean wasBatchUnload = batchUnload;
+        // The recorded batch keeps its job until the closing unload; only that last trip rotates the cursor.
+        boolean rotateJob = succeeded && (wasBatchUnload || (batchJob == null && !itemFromRestockBatch));
         retryReason = null;
         clearTransaction();
+        if (outputStored && wasBatchUnload) closeBatch();
         if (succeeded) {
             itemAttempts.clear();
             transientRetries = 0;
             flushTrips = 0;
-            // Round-robin: the next enchantItem is fetched from the next job's pickup chest, so one busy chest cannot
-            // starve every other enchantItem.
-            enchantIterator.next();
+            if (rotateJob) {
+                // Round-robin once per batch, not once per piece: four swords withdrawn together are all enchanted
+                // before the rotation moves to the pickaxe. The extra pieces are adopted from the bag with
+                // itemFromRestockBatch set, so only the chest-withdrawn piece advances the cursor.
+                enchantIterator.next();
+            }
         }
         long now = System.currentTimeMillis();
         skipUntil.entrySet().removeIf(entry -> entry.getValue() < now);
@@ -3730,8 +4367,12 @@ public class AutoEnchantModule extends Module {
 
     /** Clears every per-transaction field; attempt counters and skip cooldowns survive on purpose. */
     private void clearTransaction() {
+        // A kill window owns the aura; dropping the transaction in the middle of one has to switch it off again,
+        // otherwise a dead or queued client leaves the BOT swinging at nothing.
+        if (state == State.KILL_WINDOW) switchKillAura(false);
         state = State.ENTRYPOINT; target = null; itemSnapshot = null; operations = List.of(); books = List.of();
         operationIndex = bookIndex = 0; activeContainerId = 0; sourceSlot = playerSlot = -1;
+        fetchQueue.clear(); fetchIndex = 0; fetchBefore = 0; fetchEmpty.clear();
         failureReason = null; grindRequired = false;
         clearAllPathFutures(); clearActionFuture();
         anvilBlockCraftFuture = RequestFuture.rejected;
@@ -3752,9 +4393,14 @@ public class AutoEnchantModule extends Module {
         transactionStartedAt = 0;
         outputStored = false;
         flushing = false;
+        returningExcessInput = false;
+        batchUnload = false;
         depositSlots = List.of();
         depositRetries = 0;
         closeResent = false;
+        itemFromRestockBatch = false;
+        // batchJob / batchPieces are deliberately NOT cleared here: one batch spans several transactions and is
+        // released only by closeBatch() after its finished products have left the inventory.
         // The transient-retry counter is NOT cleared here: it has to survive a parked round, otherwise a step that
         // fails on every attempt would spin forever instead of parking the item (completeTransaction() clears it on success).
         takeAttempts = 0;
@@ -3947,10 +4593,6 @@ public class AutoEnchantModule extends Module {
         int left = findProduct(op.left());
         return left >= 0 && findProduct(op.right(), left) >= 0;
     }
-    private int findBookInTop(EnchantPresetCatalog.Enchant required) {
-        for (int slot = 0; slot < topSlots(); slot++) if (matchesBook(openContainer().getItemStack(slot), required)) return slot;
-        return -1;
-    }
     private boolean matchesBook(ItemStack stack, EnchantPresetCatalog.Enchant required) {
         if (stack == null || stack.getId() != ItemRegistry.ENCHANTED_BOOK.id()) return false;
         var component = stack.getDataComponentsOrEmpty().get(DataComponentTypes.STORED_ENCHANTMENTS);
@@ -4082,6 +4724,25 @@ public class AutoEnchantModule extends Module {
         return out.append('}').toString();
     }
 
+    /**
+     * Level cost the plan expects for merge {@code index}, including the one extra level the anvil charges for the
+     * rename that rides on that merge. This is the number a merge is budgeted with before the anvil is opened; the
+     * window's own cost line only verifies it.
+     */
+    private int plannedCostOf(int index) {
+        if (index < 0 || index >= operations.size()) return 0;
+        int cost = operations.get(index).expectedCost();
+        if (index == renameOperationIndex() && needsRename()) cost += 1;
+        return Math.max(0, cost);
+    }
+
+    /** Total levels the whole plan is expected to spend, i.e. the XP budget of one piece. */
+    private int plannedLevels() {
+        int total = 0;
+        for (int i = 0; i < operations.size(); i++) total += plannedCostOf(i);
+        return total;
+    }
+
     /** Full plan dump: the tree the preset (or planner) produced and every merge it will perform. */
     private void tracePlan() {
         // A retry after a supply gap rebuilds the same plan: print the full tree once, then a single line, so an
@@ -4095,6 +4756,7 @@ public class AutoEnchantModule extends Module {
         lastPlanSignature = signature;
         trace("plan preset={} books={} merges={} target={}", activePreset == null ? "custom" : activePreset,
             books.size(), operations.size(), describeEnchants(targetEnchants));
+        trace("plan budget: about {} levels for this piece (farmed up front, the anvil only verifies)", plannedLevels());
         for (int i = 0; i < operations.size(); i++) {
             var op = operations.get(i);
             // The planned cost is the wiki's number for this merge (enchantment value + both prior-work penalties),
