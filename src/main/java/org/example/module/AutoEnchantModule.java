@@ -4959,9 +4959,11 @@ public class AutoEnchantModule extends Module {
         if (target == null || itemSnapshot == null) return;
         // Same trigger as the completion log: the piece really left the enchant queue, so throughput is measured here.
         // Flushes and excess-input returns never reach this call, they only moved an item and produced nothing.
-        // A batch unload is counted at the deposit instead (see verifyUnloaded): it carries the whole batch, not the
-        // one piece this transaction happens to hold.
-        if (succeeded && !batchUnload) recordPieceDone();
+        // Inside a batch nothing is counted here: step order finishes most pieces by continuing in the still open
+        // anvil window, so only the occasional piece comes through this path - counting that one split the batch into
+        // one long piece and a run of two-second ones. The deposit counts the whole batch instead (see verifyUnloaded),
+        // where the real number of pieces is known.
+        if (succeeded && !batchUnload && batchJob == null) recordPieceDone();
         String duration = MathHelper.formatDuration(Duration.ofMillis(
             Math.max(0L, System.currentTimeMillis() - transactionStartedAt)));
         int levels = Math.max(0, preEnchantExpCount - carriedLevel());
