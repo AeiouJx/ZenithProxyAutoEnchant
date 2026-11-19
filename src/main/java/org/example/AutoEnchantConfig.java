@@ -29,15 +29,18 @@ public class AutoEnchantConfig {
     public boolean allowGrindstone = false;
     public int anvilRestockStacks = 1;
     /**
-     * Batch size shared by every job: how many pieces of the selected equipment are withdrawn in one restock. Global
-     * on purpose: sword, pickaxe, axe and shovel all use the same batch size, and the pieces of one batch are all
-     * enchanted before the next job is picked.
+     * How many pieces of one equipment are enchanted per batch. A restock tops the bag up to this number, counting
+     * every piece already carried (raw, half-done or finished), so it is also the number of pieces withdrawn in one
+     * trip when the bag is empty. Global on purpose: sword, pickaxe, axe and shovel all share it, and one batch is
+     * fully enchanted and unloaded before the next job is picked.
      *
      * <p>How many books that batch needs depends on {@link #batchOrder}: a row batch needs one book of every target
      * enchantment per piece (7N books for N swords, so N is capped at 4 by the 36-slot bag), while a step batch only
      * ever fetches the one or two book types of the step it is on (N is capped at about 11).
+     *
+     * <p>Was named {@code inputItemRestockStacks}; migrated in {@link #normalize(JsonObject)}.
      */
-    public int inputItemRestockStacks = 4;
+    public int batchSize = 10;
     /**
      * How one batch is advanced.
      *
@@ -173,23 +176,30 @@ final class AutoEnchantConfigSerializer implements ConfigSerializer {
     private void normalize(JsonObject root) {
         for (String field : ROOT_POSITIONS) convertPosition(root, field);
 
-        // The batch size used to live on each job. Lift the first configured value to the global field so an
-        // existing install keeps its setting; the per-job copies are dropped by convertJob below.
-        JsonElement batch = root.get("inputItemRestockStacks");
+        // The batch size used to live on each job under "inputItemRestockStacks", then globally under the same name.
+        // Keep an existing install's setting: prefer the new name, then the old global one, then the first per-job
+        // copy. The old keys are removed below / by convertJob so the file is rewritten in the new form.
+        JsonElement batch = root.get("batchSize");
         if ((batch == null || !batch.isJsonPrimitive() || !batch.getAsJsonPrimitive().isNumber())) {
-            JsonObject configured = root.getAsJsonObject("enchants");
-            if (configured != null) {
-                for (String key : configured.keySet()) {
-                    JsonElement job = configured.get(key);
-                    if (job == null || !job.isJsonObject()) continue;
-                    JsonElement old = job.getAsJsonObject().get("inputItemRestockStacks");
-                    if (old != null && old.isJsonPrimitive() && old.getAsJsonPrimitive().isNumber()) {
-                        root.add("inputItemRestockStacks", old.deepCopy());
-                        break;
+            JsonElement oldGlobal = root.get("inputItemRestockStacks");
+            if (oldGlobal != null && oldGlobal.isJsonPrimitive() && oldGlobal.getAsJsonPrimitive().isNumber()) {
+                root.add("batchSize", oldGlobal.deepCopy());
+            } else {
+                JsonObject configured = root.getAsJsonObject("enchants");
+                if (configured != null) {
+                    for (String key : configured.keySet()) {
+                        JsonElement job = configured.get(key);
+                        if (job == null || !job.isJsonObject()) continue;
+                        JsonElement old = job.getAsJsonObject().get("inputItemRestockStacks");
+                        if (old != null && old.isJsonPrimitive() && old.getAsJsonPrimitive().isNumber()) {
+                            root.add("batchSize", old.deepCopy());
+                            break;
+                        }
                     }
                 }
             }
         }
+        root.remove("inputItemRestockStacks");
 
         JsonObject books = root.getAsJsonObject("enchantBook");
         if (books != null) {

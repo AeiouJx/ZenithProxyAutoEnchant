@@ -57,6 +57,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -121,7 +122,6 @@ public class AutoEnchantModule extends Module {
     private static final int SUPPLY_SCAN_DEPTH = 8;
     /** How far above a frame the column is searched for its redstone lamp; the lamp need not touch the frame. */
     private static final int LAMP_SCAN_HEIGHT = 8;
-    private static final int RESERVE_LEVELS = 2;
     private static final float MIN_HEALTH = 12;
     /** Hard ceiling for one XP goal: a farm that runs this long has a problem, whatever the level check says. */
     private static final int KILLAURA_MAX_SECONDS = 900;
@@ -887,13 +887,16 @@ public class AutoEnchantModule extends Module {
             + " | " + distanceText(marker.framePos());
     }
 
-    /** Item name plus every enchantment it carries, e.g. {@code enchanted_book x1 [sharpness 5]}. */
+    /** Item name (custom name included) plus every enchantment it carries, e.g. {@code diamond_sword "钻石剑mx" [sharpness 5]}. */
     public String describeItem(ItemStack stack) {
         if (stack == null) return "none";
         var item = ItemRegistry.REGISTRY.get(stack.getId());
         String base = item == null ? "unknown_item_id=" + stack.getId() : shortItemId(item.name());
         StringBuilder out = new StringBuilder(base);
         if (stack.getAmount() > 1) out.append(" x").append(stack.getAmount());
+        // The custom name is printed because "did this piece come out named" is otherwise invisible in the logs.
+        String customName = catalog().customName(stack);
+        if (!customName.isEmpty()) out.append(" \"").append(customName).append('"');
         String enchantments = enchantmentText(stack);
         if (!enchantments.isEmpty()) out.append(" [").append(enchantments).append(']');
         return out.toString();
@@ -1363,9 +1366,14 @@ public class AutoEnchantModule extends Module {
             finishXp("the operation is free");
             return true;
         }
-        // The level that pays for this operation right now, plus a couple of levels so the next merge is not blocked
-        // on the exact same level it just spent.
-        int goal = cost + RESERVE_LEVELS;
+        // Farm exactly the level this call needs - not twice it and not a reserve above it. The anvil will not take
+        // the result before that level, and every level beyond it is time spent killing at the exp spot instead of
+        // standing at the anvil. The callers budget over the rest of the piece (see plannedRemainingCostOf), so this
+        // is still one trip per piece; the goal already carries the plan's observed cost gap (planCostBias), so the
+        // anvil's own cost line is covered without a second farm, and what a cheaper merge leaves over stays on the
+        // BOT for the merges of the same piece that follow. Whatever is left when the piece ends is spent by the next
+        // piece's own budget check instead of being farmed twice for the same level.
+        int goal = cost;
         // A different operation means a different goal: its own farm budget.
         if (xpGoalLevel != goal || xpGoalCost != cost) {
             xpFarmStartedAt = 0;
@@ -1460,6 +1468,10 @@ public class AutoEnchantModule extends Module {
         xpGoalCost = -1;
         xpFarmStartedAt = 0;
         if (!wasFarming) return;
+        // The farm itself was a fight with the aura on: count it as the periodic silverfish clear so the next kill
+        // window waits a full gap. Without this, XP reaching its goal flips the aura off and the very next tick the
+        // gap has already elapsed, so a second window opens and delays the anvil interaction the BOT was farming for.
+        lastKillWindowAt = System.currentTimeMillis();
         var player = CACHE.getPlayerCache().getThePlayer();
         status = "XP ready: " + reason;
         info("[trace] XP goal finished: {}{}", reason,
@@ -1677,6 +1689,17 @@ public class AutoEnchantModule extends Module {
     private long restockWaitTicks = 20L;
     /** True while a container-open path is walking; the future itself lives in its trip's own field. */
     private boolean openPathPending;
+    /**
+     * Open clicks of the current attempt that produced no window.
+     *
+     * <p>The server quietly drops a right click it cannot serve right now - typically the first click after another
+     * window closed or right after a kill window - and the click itself is cheap. The first two misses therefore get a
+     * quarter of the interaction budget before the click is re-sent, instead of a full second each: an anvil that
+     * answered only on the third click used to cost three seconds.
+     */
+    private int openClickMisses;
+    /** Block the misses above were counted at, so a different chest or anvil starts with a full budget again. */
+    private BlockPos openMissPosition;
     /** The OPEN_* state a failed or stale window returns to, mirroring the trader's chest states. */
     private State openState = State.ENTRYPOINT;
     private BlockPos openingPosition;
@@ -1685,6 +1708,10 @@ public class AutoEnchantModule extends Module {
     private int waitingCost;
     private BlockPos anvilPosition;
     private int anvilRecoveryAttempts;
+    /** When the placement request was issued, used only to bound how long the bot may take to walk up and click. */
+    private long anvilPlacementAt;
+    /** When the placement click was seen to be dispatched; the confirm window for the block runs from here. */
+    private long anvilClickAt;
     /**
      * True while the anvil station is being rebuilt before a new transaction starts. The recovery itself is the same
      * path a mid-transaction anvil step uses, but it must end back in {@link State#ENTRYPOINT} instead of opening the
@@ -1703,8 +1730,78 @@ public class AutoEnchantModule extends Module {
     private boolean backToBooks;
     /** Rename passes whose preview never showed the requested name; a cosmetic name is never worth blocking the item. */
     private int renameTries;
+    /**
+     * How many carried pieces already wore the target name when the rename pass put its input into the anvil.
+     *
+     * <p>A batch carries several physically identical pieces, so "some piece in the bag has that name" is no proof
+     * that this pass renamed anything: an already named sibling satisfies it and the pass is closed as done while the
+     * piece on the anvil goes back to the bag unnamed. Only a rise in that count proves the pass worked.
+     */
+    private int namedBeforeRename;
     /** Set when the server refuses to apply the name, so the item is unloaded as it is instead of retrying forever. */
     private boolean renameGivenUp;
+    /** True when the rename packet went out with the inputs of the merge currently on the anvil. */
+    private boolean renameSentThisMerge;
+    /**
+     * True while the open anvil's name field still holds a name written for the equipment.
+     *
+     * <p>An anvil keeps the typed name for its next operation: the book pair merged right after a named sword came out
+     * named "钻石剑mx" and stopped stacking with its own copies. The field is therefore cleared as soon as a merge that
+     * does not produce the equipment is placed in the same window.
+     */
+    private boolean anvilNameFieldDirty;
+    /**
+     * Largest gap seen between what the plan says a merge costs and what this server actually charges (capped).
+     *
+     * <p>The plan is the budget: the level is farmed by it before the anvil is opened, and the anvil's own cost line
+     * only verifies it. A merge that turns out more expensive than the wiki's table predicts is learnt here so the
+     * next anvil is stocked above its plan instead of running dry inside the window.
+     */
+    private int planCostBias;
+    /** One full shulker box of equipment: 27 slots, one piece each. The throughput stat is reported per box. */
+    private static final int SHULKER_BOX_PIECES = 27;
+    /**
+     * Throughput counters: how long one piece takes and how long a full shulker box takes.
+     *
+     * <p>Piece time is the wall clock between two completions, not the time spent inside one anvil window. A batch is
+     * processed step by step, so its ten pieces share the same windows and only the completion rate is a meaningful
+     * per-piece number; the box figure is the same measure over 27 pieces, i.e. exactly one full shulker box of
+     * equipment.
+     */
+    private static final class ThroughputStats {
+        long lastAt;
+        long lastMs;
+        long totalMs;
+        long minMs;
+        long maxMs;
+        int pieces;
+        long boxStartedAt;
+        int boxPieces;
+        int boxesDone;
+        long boxTotalMs;
+        long boxBestMs;
+        long boxWorstMs;
+        long batchStartedAt;
+        int batchPieces;
+        int batchesDone;
+        int batchPiecesTotal;
+        long batchTotalMs;
+        long batchBestMs;
+        long batchWorstMs;
+    }
+
+    private final ThroughputStats stats = new ThroughputStats();
+    /**
+     * Equipment merges whose preview never produced a result while the name field was filled in.
+     *
+     * <p>Re-asserting the name on a merge is the only way the name survives a merge on this server, but a server that
+     * answers a same-name rename with a red X would leave the anvil with no output and the piece would be retried
+     * forever. Two silent previews are therefore read as "this anvil will not take the name again", and the rest of
+     * the piece runs without the packet - the end-of-piece rename pass still writes the name, just dearer.
+     */
+    private int renameMergeRefusals;
+    /** Set after {@link #renameMergeRefusals} tripped: later merges of this piece leave the name field alone. */
+    private boolean renameOnMergeDisabled;
     /** Guards the per-merge preview/inventory trace so a tick loop logs each step once, not every tick. */
     private boolean stepLogged;
     /** True once the finished enchantItem left the BOT inventory, i.e. the output step really completed. */
@@ -1740,6 +1837,16 @@ public class AutoEnchantModule extends Module {
     /** Signature of the last dumped plan, so a repeated plan dump does not re-print the same tree every retry. */
     private String lastPlanSignature = "";
     private static final int MAX_ANVIL_RECOVERY = 3;
+    /** How long the bot may take to walk up to the station and dispatch the placement click before it counts as stuck. */
+    private static final long ANVIL_PLACEMENT_DISPATCH_MS = 5_000L;
+    /**
+     * How long the block may take to show up after the click went out (server round trip, chunk cache lag).
+     *
+     * <p>One short window for the first click and for every re-place alike: a placement click the server silently
+     * drops (the usual case right after another window closed) never lands at all, so a longer wait only delays the
+     * retry that fixes it. A block that really shows up late is still adopted by the next {@code CHECK_ANVIL} tick.
+     */
+    private static final long ANVIL_PLACEMENT_CONFIRM_MS = 800L;
     /** The one genuine enchant failure: the server refuses the operation because its level cost is too high. */
     private static final int TOO_EXPENSIVE_LEVEL = 40;
     /** Consecutive transient retries of the same enchantItem before it is parked in the inventory for a while. */
@@ -1782,6 +1889,8 @@ public class AutoEnchantModule extends Module {
     /** Item id and carried-stack count captured before a restock withdrawal, used to size the batch. */
     private int restockItemId = -1;
     private int restockBefore;
+    /** Pieces the restock click asked for, so a short delivery can name the number that never arrived. */
+    private int restockWanted;
     /**
      * Containers whose block has actually disappeared (someone took the shulker box / barrel away), with the time
      * until the next check and the number of consecutive misses. Unlike an empty chest this cannot be fixed by
@@ -1848,13 +1957,15 @@ public class AutoEnchantModule extends Module {
                 clearMissingContainer(openingPosition);
                 clearOpenPathFuture();
                 waitForInteractTimer.reset();
+                openClickMisses = 0;
             } else if (path != null && !path.isCompleted()) {
                 // Keep walking; the future resolves once the click was actually executed.
                 return;
-            } else if (path == null || !path.isAccepted() || waitForInteractTimer.tick(interactTimeoutTicks())) {
+            } else if (path == null || !path.isAccepted() || waitForInteractTimer.tick(openRetryTicks())) {
                 // Distinguish "the pathfinder never got there" from "the click ran but no window appeared": the first
                 // is a reachability problem, the second means the block is not a usable container right now.
                 boolean noPath = path == null || !path.isAccepted();
+                if (!noPath) noteOpenClickMiss();
                 clearOpenPathFuture();
                 // No counter and no retry bookkeeping: the open state is simply entered again.
                 reopenContainer(noPath ? "no path to " + openingPosition : "no window after clicking " + openingPosition);
@@ -1866,6 +1977,11 @@ public class AutoEnchantModule extends Module {
                 if (waitForInteractTimer.tick(interactTimeoutTicks())) reopenContainer("no usable container window");
                 return;
             }
+            // The window is here, so whatever miss led up to it is settled: the next open starts on the short budget
+            // again. Without this the counter only grew, and at a block that is opened over and over (the anvil) the
+            // third open and every one after it waited the full interaction budget before clicking a second time.
+            openClickMisses = 0;
+            openMissPosition = null;
             // Let the server finish sending window contents before any slot is read or clicked.
             // Like the trader's playerSectionHasItems check, the player section carries data only
             // once the contents packet arrived; the timeout lets a genuinely empty inventory through.
@@ -1971,6 +2087,10 @@ public class AutoEnchantModule extends Module {
             if (!beginBatchUnload()) closeBatch();
             return;
         }
+        // No batch record, but the bag may still hold finished pieces of a batch whose record died with the process.
+        // Without adopting them the picker sees "nothing to resume", the quota counts those very pieces as a full
+        // batch and the workflow loops on the pickup chest without ever withdrawing or unloading anything.
+        if (adoptOrphanFinishedBatch(runnable)) return;
         // Nothing of ours to resume, but the bag is too full to fetch another piece: unload finished products that are
         // still waiting in the inventory (the output container was full or its marker was missing at the time) so the
         // next cycle has room again. A full bag used to dead-end here: the withdraw click silently did nothing and the
@@ -2080,8 +2200,9 @@ public class AutoEnchantModule extends Module {
             if (onlyJob != null && job.get() != onlyJob) continue;
             if (isCoolingDown(stack)) continue;
             // A finished product waiting for the batch unload is not work: it has the highest progress score, so
-            // without this guard beginInput would pick it up again and replay a no-op transaction forever.
-            if (normalizedEnchants(stack).equals(targetEnchantsOf(job.get()))) continue;
+            // without this guard beginInput would pick it up again and replay a no-op transaction forever. A piece
+            // whose enchantments are complete but whose NAME is not is still work - it needs the rename pass.
+            if (isDeliverable(job.get(), stack)) continue;
             int score = progressScore(stack);
             if (stepOrder() ? score < bestScore : score > bestScore) { bestScore = score; bestSlot = slot; }
         }
@@ -2231,12 +2352,26 @@ public class AutoEnchantModule extends Module {
         int selected = -1;
         ItemStack chosen = null;
         AutoEnchantConfig.Enchant chosenTarget = null;
+        int skippedFinished = 0;
         for (int slot = 0; slot < top; slot++) {
             ItemStack stack = openContainer().getItemStack(slot);
             Optional<AutoEnchantConfig.Enchant> match = runnableJobFor(stack);
             if (match.isEmpty()) continue;
+            // A finished piece is a deliverable, not input: withdrawing it would only carry it through the anvil
+            // again, where every merge it needs is already applied. Such pieces reach an input chest by hand or from
+            // an earlier unload that missed its output chest, so they are skipped instead of being taken as blanks.
+            // A piece whose enchantments are complete but whose NAME is wrong is not skipped: taking it in is the
+            // only way it gets the rename pass that the operator put it there for.
+            if (isDeliverable(match.get(), stack)) {
+                skippedFinished++;
+                continue;
+            }
             selected = slot; chosen = stack; chosenTarget = match.get();
             break;
+        }
+        if (skippedFinished > 0) {
+            trace("pickup chest at {}: skipped {} finished piece(s) that already match their target",
+                openingPosition, skippedFinished);
         }
         if (selected < 0) {
             // Nothing this chest can serve. The rotation moves on at once so the next chest (and the next job) gets its
@@ -2302,7 +2437,14 @@ public class AutoEnchantModule extends Module {
         if (current.equals(targetEnchants)) {
             operations = List.of();
             books = List.of();
-            setWorkflowStatus("Fetched item already matches the target; unloading unchanged");
+            // The enchantments are complete, but the name may still be wrong - that is exactly the case of a finished
+            // piece put back into an input chest by hand. Nothing else is replayed; the empty plan sends the piece
+            // straight to the rename-only pass.
+            boolean rename = needsRename();
+            setWorkflowStatus(rename
+                ? "Fetched item is already enchanted; only its name needs the anvil"
+                : "Fetched item already matches the target; unloading unchanged");
+            trace("fetched item is already enchanted; {}", rename ? "a rename-only pass follows" : "nothing left to do");
             return;
         }
         if (!withinPlan(current)) {
@@ -2489,7 +2631,7 @@ public class AutoEnchantModule extends Module {
 
     /**
      * Withdraws the current equipment piece plus more of the same equipment from the same chest in one inventory
-     * request. The global {@code inputItemRestockStacks} is the batch size, so the following pieces are processed
+     * request. The global {@code batchSize} is how many pieces make one batch, so the following pieces are processed
      * straight from the BOT inventory without reopening this chest, and the next job is not picked until they are all
      * done.
      */
@@ -2505,23 +2647,50 @@ public class AutoEnchantModule extends Module {
             setWorkflowStatus("Bag is full: no free slot to take the withdrawal");
             return;
         }
-        // Top the batch up instead of always taking four: half-done pieces already in the bag count towards the
-        // batch, so a bag holding two of them only withdraws two more. At least one is taken so the rotation and the
-        // "came from the chest" marker always have a piece to attach to.
-        int batchSize = Math.max(1, PLUGIN_CONFIG.inputItemRestockStacks);
-        // Count every carried piece of the batch, finished ones included: they still occupy a slot of the four until
-        // the whole batch is unloaded. Using the pending-only count here refilled one raw sword per finished piece.
-        int alreadyCarried = countCarriedBatchPieces();
-        int wanted = Math.max(1, Math.min(batchSize - alreadyCarried, free));
-        trace("pickup batch: {} piece(s) already carried, withdrawing {} more (batch size {})",
-            alreadyCarried, wanted, batchSize);
+        // Top the batch up to the configured size with what the bag ALREADY holds. This MUST be a physical count of
+        // every carried sword of this job - raw, half-done, finished, cooling or cursed - because all of them occupy a
+        // slot. countCarriedBatchPieces() skips cooling pieces; a cooling half-done sword was then neither resumed
+        // (findCarriedEquipment skips it too) nor counted here, so every cycle withdrew a full batch again until the
+        // bag was jammed with 17 swords and no book could fit.
+        int batchSize = Math.max(1, PLUGIN_CONFIG.batchSize);
+        int alreadyCarried = countCarriedById(configuredItemId());
+        int wanted = Math.min(batchSize - alreadyCarried, free);
+        // How much this chest can actually give: a batch that ends up short is either an empty pickup chest or pieces
+        // the withdraw filter refused, and the two look identical in the batch line alone.
+        int offered = 0;
+        for (int slot = 0; slot < topSlots(); slot++) {
+            ItemStack stack = openContainer().getItemStack(slot);
+            if (stack == null || stack.getId() != configuredItemId()) continue;
+            if (isDeliverable(target, stack)) continue;
+            offered++;
+        }
+        trace("pickup batch: {} piece(s) already carried, withdrawing {} more (batch size {}, {} free slot(s), "
+            + "chest offers {} takeable piece(s))", alreadyCarried, wanted, batchSize, free, offered);
+        if (wanted <= 0) {
+            // The bag already holds a whole batch (or every free slot is spoken for). Do not withdraw another piece:
+            // drop the chest selection, unfreeze the carried pieces so beginInput() can adopt one, and go back to the
+            // entry point. Without the unfreeze a bag of cooling half-done pieces would bounce open/close forever
+            // while the picker keeps believing it has nothing to resume.
+            int unfrozen = clearCooldownForCarriedJob(target);
+            restockItemId = -1;
+            restockBefore = 0;
+            restockWanted = 0;
+            trace("pickup skipped: bag already has {} of {} piece(s); unfroze {} carried piece(s), resuming from the bag",
+                alreadyCarried, batchSize, unfrozen);
+            closeContainer(State.ENTRYPOINT);
+            return;
+        }
         restockItemId = configuredItemId();
         restockBefore = countCarriedById(restockItemId);
+        restockWanted = wanted;
         List<com.zenith.feature.inventory.actions.InventoryAction> actions = new ArrayList<>(
-            InventoryActionMacros.withdraw(openContainerId(), stack -> stack.getId() == configuredItemId(), wanted));
+            InventoryActionMacros.withdraw(openContainerId(),
+                stack -> stack.getId() == configuredItemId() && !isDeliverable(target, stack),
+                wanted));
         if (actions.isEmpty()) {
             restockItemId = -1;
             restockBefore = 0;
+            restockWanted = 0;
             actions.add(new ShiftClick(openContainerId(), sourceSlot, ShiftClickItemAction.LEFT_CLICK));
         }
         setWorkflowStatus("Withdrawing " + actions.size() + " equipment piece(s) for job " + target.displayName());
@@ -2550,6 +2719,13 @@ public class AutoEnchantModule extends Module {
     private void recordRestockBatch() {
         if (restockItemId < 0) return;
         int withdrawn = countCarriedById(restockItemId) - restockBefore;
+        // A short delivery is the usual reason a batch holds fewer pieces than the configured size: the chest ran out
+        // or the filter refused the rest. Naming both numbers keeps it out of the "where did the pieces go" category.
+        if (restockWanted > 0 && withdrawn != restockWanted) {
+            trace("withdraw came up short: {} of {} piece(s) arrived (the chest ran out or the rest was refused)",
+                withdrawn, restockWanted);
+        }
+        restockWanted = 0;
         int extra = withdrawn - 1; // the first piece is the current transaction
         String key = Integer.toString(restockItemId);
         if (extra > 0) restockBatch.put(key, extra); else restockBatch.remove(key);
@@ -2788,7 +2964,7 @@ public class AutoEnchantModule extends Module {
         fetchQueue.clear();
         fetchIndex = 0;
         if (target == null || targetEnchants.isEmpty()) return false;
-        int batchSize = Math.max(1, PLUGIN_CONFIG.inputItemRestockStacks);
+        int batchSize = Math.max(1, PLUGIN_CONFIG.batchSize);
         // A recorded batch can be larger than the nominal fetch size when unfinished pieces were already in the bag.
         // Plan books for all of its pieces in one campaign instead of leaving the extras for a second campaign.
         int cap = batchJob != null ? Math.max(batchSize, Math.max(batchPieces, countCarriedBatchPieces())) : batchSize;
@@ -2937,6 +3113,20 @@ public class AutoEnchantModule extends Module {
     }
 
     private void placeAnvilInputs() {
+        int windowId = openContainerId();
+        if (windowId == 0 || windowId != activeContainerId) {
+            // The window can close in the tick between "this step continues in the anvil that is still open" and the
+            // placements that carry that decision out: an anvil that spent its last use changes block state and the
+            // server closes the window with it. Placing anyway sent two clicks into a window that no longer existed,
+            // left slot 2 empty, and was only noticed 1.5s later as "Anvil preview timed out" - a park, a back-off and
+            // a kill window for what is really "open the next anvil". CHECK_ANVIL reopens it, or fetches a replacement
+            // when the block is gone, and the piece keeps its progress either way.
+            trace("merge[{}] anvil window closed before the inputs were placed (open={} expected={}); reopening",
+                operationIndex, windowId, activeContainerId);
+            waitForActionTimer.reset();
+            state = State.CHECK_ANVIL;
+            return;
+        }
         activeOperation = operations.get(operationIndex);
         int left = findProduct(activeOperation.left());
         int right = findProduct(activeOperation.right(), left);
@@ -2959,11 +3149,15 @@ public class AutoEnchantModule extends Module {
         }
         trace("merge[{}] placing slot {} {} + slot {} {}", operationIndex,
             left, describeItem(playerItem(left)), right, describeItem(playerItem(right)));
-        if (containsTarget(activeOperation.result(), targetPlaceholder())) {
-            // Renames are worth one log line each: the name decides whether the passenger rename has to ride on this
-            // merge, and a name that a merge silently drops is only visible by comparing the two lines.
-            trace("merge[{}] equipment name before merge: '{}' (target '{}')", operationIndex,
-                itemSnapshot == null ? "" : catalog().customName(itemSnapshot), desiredRename());
+        boolean equipmentMerge = activeOperation != null
+            && containsTarget(activeOperation.result(), targetPlaceholder());
+        if (equipmentMerge) {
+            // The piece's own name against the template name. A merge on this server rebuilds the result from its
+            // inputs and drops a custom name that the packet does not write again, so the name field is filled in on
+            // EVERY equipment merge - starting with the first one, where the piece is still fresh and a rename costs
+            // one level instead of the whole prior-work penalty a rename pass on a finished piece would be charged.
+            trace("merge[{}] equipment name before merge: '{}' (template '{}', re-assert={})", operationIndex,
+                itemSnapshot == null ? "" : catalog().customName(itemSnapshot), desiredRename(), renamesOnMerge());
         }
         // A quick move is one packet instead of two (pick up + place) and is what a player does. The
         // server picks the destination itself: the first empty input slot, or one already holding the
@@ -2977,13 +3171,34 @@ public class AutoEnchantModule extends Module {
             && !sameStack(leftStack, rightStack);
         List<com.zenith.feature.inventory.actions.InventoryAction> actions = new ArrayList<>(moveIntoStation(left, 0, inputsEmpty));
         actions.addAll(moveIntoStation(right, 1, quickRight));
-        // The rename rides on the first merge that involves the equipment. Nothing is sent when the name would not
-        // change: the anvil shows a red X for a rename that changes nothing (and an empty field cannot clear a name
-        // the item does not have), so only a real change is ever requested. Not sending a name at all leaves the
-        // item's existing name alone, which is why later merges need no packet.
-        if (operationIndex == renameOperationIndex() && needsRename()) {
-            trace("merge[{}] name field <- '{}'", operationIndex, desiredRename());
+        // The name rides on every merge that touches the equipment, and on the first one above all: that is the
+        // cheapest moment (a fresh piece pays one level) and it is the only way the name survives, because a merge
+        // that is not told the name comes back unnamed - the piece goes into the anvil as "钻石剑mx" and the result
+        // slot reports ''. Every other merge (a book pair) gets an explicitly EMPTY name instead, so a field left over
+        // from the equipment merge can never paint the result.
+        if (renamesOnMerge()) {
+            trace("merge[{}] name field <- '{}' (piece '{}')", operationIndex, desiredRename(),
+                itemSnapshot == null ? "" : catalog().customName(itemSnapshot));
             actions.add(new RenameItem(openContainerId(), desiredRename()));
+            renameSentThisMerge = true;
+            anvilNameFieldDirty = true;
+        } else if (equipmentMerge) {
+            // An equipment merge that must NOT be named (no template name, or the merge-rename was given up). The
+            // field is left exactly as it is: an empty name field makes this anvil rebuild the result without the
+            // piece's own name, which is the very thing the packet above exists to prevent.
+            trace("merge[{}] equipment merge without a name packet (name field left untouched)", operationIndex);
+            renameSentThisMerge = false;
+        } else {
+            // A book pair merged after a named sword inherits the name the field still holds, comes out named and
+            // stops stacking with its own copies. The field is therefore cleared on EVERY merge that does not
+            // produce the equipment - not only when a flag says an equipment merge came before it, because a plan
+            // refresh in the middle of the window resets that flag while the server keeps the typed name.
+            if (anvilNameFieldDirty) {
+                trace("merge[{}] clearing the name field left over from the equipment merge", operationIndex);
+            }
+            actions.add(new RenameItem(openContainerId(), ""));
+            renameSentThisMerge = false;
+            anvilNameFieldDirty = false;
         }
         stepLogged = false;
         clearAnvilCost();
@@ -3028,6 +3243,7 @@ public class AutoEnchantModule extends Module {
         if (name == null) { state = State.CLOSE_ANVIL; return; }
         playerSlot = findCurrentEquipment();
         if (playerSlot < 0) { keepAndRetry("Cannot find the enchantItem to rename"); return; }
+        namedBeforeRename = countNamedStacks(name);
         List<com.zenith.feature.inventory.actions.InventoryAction> actions =
             new ArrayList<>(moveIntoStation(playerSlot, 0, stationInputsEmpty()));
         actions.add(new RenameItem(openContainerId(), name));
@@ -3049,19 +3265,51 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
-     * Index of the last plan operation whose result is the equipment; the name travels with that merge.
+     * True when the inputs of the merge on the anvil have to be submitted together with the name field.
      *
-     * <p>A merge costs the same with or without a name (renaming adds exactly 1 level and does not accumulate
-     * penalty), but only the last equipment merge is guaranteed to be followed by nothing that could drop the name
-     * again. A rename performed as its own anvil pass, on the other hand, is charged the item's whole prior-work
-     * penalty - 16 levels on a finished sword instead of 1 - which is what this index exists to avoid.
+     * <p>The name is written on the first merge that touches the equipment - the cheapest moment, one level on a
+     * fresh piece - and re-asserted on every later equipment merge, because a merge on this server returns the result
+     * without the custom name unless the field is written again. Comparing the piece's own name with the template
+     * name and skipping the packet when they match is what silently produced unnamed swords: the piece went into the
+     * anvil named and the result slot came back blank.
+     *
+     * <p>Only a clear-name job (empty template name) is filtered here, since an empty field changes nothing on a piece
+     * that has no name - the anvil answers that with a red X. After a couple of silent previews
+     * ({@link #renameMergeRefusals}) the packet is dropped for the rest of the piece and the end-of-piece rename pass
+     * finishes the name instead.
      */
-    private int renameOperationIndex() {
+    private boolean renamesOnMerge() {
+        if (activeOperation == null || renameGivenUp || renameOnMergeDisabled) return false;
+        if (!containsTarget(activeOperation.result(), targetPlaceholder())) return false;
+        String name = desiredRename();
+        if (name == null) return false;
+        return !name.isEmpty() || needsRename();
+    }
+
+    /** Index of the first plan operation whose result is the equipment, i.e. where the name is written first. */
+    private int firstEquipmentMerge() {
         String placeholder = targetPlaceholder();
-        for (int i = operations.size() - 1; i >= 0; i--) {
+        for (int i = 0; i < operations.size(); i++) {
             if (containsTarget(operations.get(i).result(), placeholder)) return i;
         }
         return -1;
+    }
+
+    /**
+     * True when merge {@code index} is the one that actually writes the piece's name, i.e. the merge the anvil charges
+     * the extra level for: the first equipment merge, and only while the piece is still unnamed.
+     *
+     * <p>The name packet itself is re-sent on every later equipment merge (this server rebuilds the result and drops a
+     * custom name the field does not carry), but re-writing the name a piece already wears changes nothing and is free
+     * - the anvil only charges the extra level for the merge that renames it. Adding the level to every equipment merge
+     * made a 14-level step look like 15 and farmed one level too many for it.
+     */
+    private boolean renameAppliesTo(int index) {
+        if (index < 0 || index >= operations.size()) return false;
+        if (!containsTarget(operations.get(index).result(), targetPlaceholder())) return false;
+        if (index != firstEquipmentMerge()) return false;
+        String name = desiredRename();
+        return name != null && !name.isEmpty() && needsRename();
     }
 
     /**
@@ -3076,9 +3324,13 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
-     * True only when the anvil would really apply a rename: the item must already have a name to clear, and the new
-     * name must differ from the current one. Anything else paints a red X on the anvil and yields no output at all,
-     * so it must never be requested - not even while merging.
+     * True when this piece's own name differs from the template name, i.e. the name still has to be written.
+     *
+     * <p>This is the comparison the piece is judged by - the piece in hand against {@code target.renameName} - and it
+     * is used to decide the rename pass at the END of a piece and to decide whether an empty template name is a
+     * meaningful "clear it". It is deliberately no longer a gate on the merge packet: on this server a merge drops a
+     * custom name that is not written again, so "the piece already wears the name" is exactly the state in which the
+     * packet must still be sent - see {@link #renamesOnMerge()}.
      */
     private boolean needsRename() {
         String name = desiredRename();
@@ -3088,6 +3340,14 @@ public class AutoEnchantModule extends Module {
 
     private void verifyAnvilPreview() {
         if (renamePass) { verifyRenamePreview(); return; }
+        if (openContainerId() == 0) {
+            // Nothing to preview without a window: the anvil's last use closes it. Waiting the full result budget for
+            // a slot that no longer exists only delays the reopen, so hand it to CHECK_ANVIL at once.
+            trace("merge[{}] preview: the anvil window is gone; reopening", operationIndex);
+            waitForActionTimer.reset();
+            state = State.CHECK_ANVIL;
+            return;
+        }
         ItemStack result = openContainer().getItemStack(2);
         OptionalIntCost price = currentCost();
         // Survival servers keep reporting the level cost but blank the result slot once the operation passes the
@@ -3102,27 +3362,56 @@ public class AutoEnchantModule extends Module {
         }
         boolean empty = result == null || result == Container.EMPTY_STACK;
         if (empty || price.value < 0) {
+            // The anvil is consumed by its last use, and the preview of that very merge never arrives because the
+            // window belongs to a block that is gone. Watching the block during the wait turns this into the normal
+            // "fetch a replacement" recovery within a tick instead of a full result timeout plus a parked piece.
+            if (anvilPosition != null && !isAnvilBlock(anvilPosition)) {
+                trace("merge[{}] preview: the anvil at {} is gone; fetching a replacement", operationIndex,
+                    anvilPosition);
+                keepAndRetry("Anvil is gone while merge[" + operationIndex + "] was waiting for its preview");
+                return;
+            }
             // No result yet: the window or the preview packet is still in flight, which is not a failure.
             if (waitForActionTimer.tick(resultTimeoutTicks())) {
                 trace("merge[{}] preview never showed a result (result={} cost={})", operationIndex,
                     describeItem(result), price.value);
+                // A same-name rename can be answered with a red X by an anvil that only accepts a real change. That
+                // would leave the piece stuck forever, so the packet is dropped after two silent previews and the
+                // name is finished by the rename pass instead of blocking the whole batch.
+                if (renameSentThisMerge && ++renameMergeRefusals >= 2 && !renameOnMergeDisabled) {
+                    renameOnMergeDisabled = true;
+                    trace("merge[{}] anvil keeps refusing the name field; the rest of this piece merges without it "
+                        + "and the rename pass writes the name", operationIndex);
+                }
                 keepAndRetry("Anvil preview timed out for merge[" + operationIndex + "]");
             }
             return;
         }
         String mismatch = productMismatch(result, activeOperation.result(), false);
+        int plannedCost = activeOperation.expectedCost() + (renameAppliesTo(operationIndex) ? 1 : 0);
         if (!stepLogged) {
             stepLogged = true;
             // Penalty is the wiki's prior-work penalty (2^uses - 1): it is what pushes the last merges towards the
             // 39-level limit, so both the old and the resulting value are printed next to the cost.
             trace("merge[{}] preview: result={} cost={} planned={} penalty {} -> {} expected={} match={}", operationIndex,
-                describeItem(result), price.value,
-                activeOperation.expectedCost() + (operationIndex == renameOperationIndex() && needsRename() ? 1 : 0),
+                describeItem(result), price.value, plannedCost,
                 itemSnapshot == null ? 0 : catalog().priorWorkPenalty(itemSnapshot),
                 catalog().priorWorkPenalty(result),
                 describeEnchants(expectedEnchants(activeOperation.result(), targetPlaceholder())),
                 mismatch == null);
             if (mismatch != null) trace("merge[{}] result rejected: {}", operationIndex, mismatch);
+            // The plan is what the level is farmed by before the anvil is opened, so an operation this server
+            // charges more for than the wiki's table says would otherwise be discovered inside the window, where the
+            // only way out is closing the anvil and fighting again. The measured gap is therefore remembered and
+            // added to the pre-anvil budget of the following merges.
+            if (price.value > plannedCost) {
+                int gap = Math.min(3, price.value - plannedCost);
+                if (gap > planCostBias) {
+                    planCostBias = gap;
+                    trace("merge[{}] charged {} instead of the planned {}; later anvils are stocked {} level(s) "
+                        + "above their plan", operationIndex, price.value, plannedCost, planCostBias);
+                }
+            }
         }
         if (mismatch != null) {
             // The anvil shows something other than the planned merge: close it and let the item be re-planned from
@@ -3130,14 +3419,24 @@ public class AutoEnchantModule extends Module {
             keepAndRetry("Anvil result did not match merge[" + operationIndex + "]");
             return;
         }
-        waitingCost = price.value;
-        if (!ensureXpForCost(price.value)) { state = State.CLOSE_FOR_XP; return; }
+        // Farm for the rest of the piece, not for this one merge: a 3-level merge followed by an 11-level merge would
+        // otherwise close the anvil for 3 levels, come back, and close it again for 11.
+        int refill = refillBudget(price.value);
+        waitingCost = refill;
+        renameMergeRefusals = 0;
+        if (!ensureXpForCost(refill)) { state = State.CLOSE_FOR_XP; return; }
         state = State.TAKE_RESULT;
     }
 
     /** A rename-only preview must show the new name; the enchantments are not part of this check. */
     private void verifyRenamePreview() {
         String name = desiredRename();
+        if (openContainerId() == 0) {
+            trace("rename preview: the anvil window is gone; reopening");
+            waitForActionTimer.reset();
+            state = State.CHECK_ANVIL;
+            return;
+        }
         ItemStack result = openContainer().getItemStack(2);
         OptionalIntCost price = currentCost();
         if (name == null) { keepAndRetry("Rename name disappeared before the anvil preview"); return; }
@@ -3151,6 +3450,11 @@ public class AutoEnchantModule extends Module {
         }
         boolean empty = result == null || result == Container.EMPTY_STACK;
         if (empty || price.value < 0) {
+            if (anvilPosition != null && !isAnvilBlock(anvilPosition)) {
+                trace("rename preview: the anvil at {} is gone; fetching a replacement", anvilPosition);
+                keepAndRetry("Anvil is gone while the rename pass was waiting for its preview");
+                return;
+            }
             if (waitForActionTimer.tick(resultTimeoutTicks())) {
                 // A red X (no output at all) means the anvil refused the rename: never let a label hold the item back.
                 trace("rename preview produced no output (result={} cost={}); rename refused?", describeItem(result), price.value);
@@ -3180,8 +3484,9 @@ public class AutoEnchantModule extends Module {
             return;
         }
         if (!stepLogged) { stepLogged = true; trace("rename preview ok: '{}' cost={}", name, price.value); }
-        waitingCost = price.value;
-        if (!ensureXpForCost(price.value)) { state = State.CLOSE_FOR_XP; return; }
+        int refill = refillBudget(price.value);
+        waitingCost = refill;
+        if (!ensureXpForCost(refill)) { state = State.CLOSE_FOR_XP; return; }
         state = State.TAKE_RESULT;
     }
 
@@ -3189,9 +3494,9 @@ public class AutoEnchantModule extends Module {
         // Not enough levels yet is a waiting condition, not a failure: the item keeps its progress and is resumed
         // once XP farming can start again (or a later cycle tries again).
         if (consumeXpInterruption()) { keepAndRetry("XP farming is unavailable right now"); return; }
-        // waitingCost is 0 when the gate was entered from the plan instead of from an anvil window; the planned cost of
-        // the next merge is then the number to farm for.
-        int cost = waitingCost > 0 ? waitingCost : plannedCostOf(operationIndex);
+        // waitingCost is 0 when the gate was entered from the plan instead of from an anvil window; the rest of the
+        // piece's plan is then the number to farm for, exactly as the anvil-window path budgets it.
+        int cost = waitingCost > 0 ? waitingCost : refillBudget(plannedCostOf(operationIndex));
         if (ensureXpForCost(cost)) state = State.CHECK_ANVIL;
     }
 
@@ -3225,6 +3530,13 @@ public class AutoEnchantModule extends Module {
 
     private void verifyAnvilResult() {
         if (renamePass) {
+            // A rename only counts when the bag gained one more named piece: scanning for "any piece with that name"
+            // let an identical sibling that was named by an earlier pass answer for this one, the pass was closed as
+            // done and the piece still on the anvil went back into the bag without a name.
+            if (countNamedStacks(desiredRename()) <= namedBeforeRename) {
+                if (waitForActionTimer.tick(resultTimeoutTicks())) keepAndRetry("Renamed enchantItem was not received");
+                return;
+            }
             int renamed = findRenamedItem(desiredRename());
             if (renamed >= 0) {
                 itemSnapshot = playerItem(renamed).clone();
@@ -3241,8 +3553,17 @@ public class AutoEnchantModule extends Module {
             boolean equipment = containsTarget(activeOperation.result(), targetPlaceholder());
             if (equipment) itemSnapshot = playerItem(resultSlot).clone();
             trace("merge[{}] done: took slot {} {}", operationIndex, resultSlot, describeItem(playerItem(resultSlot)));
-            if (equipment) trace("merge[{}] equipment name after merge: '{}'", operationIndex,
-                catalog().customName(itemSnapshot));
+            if (equipment) {
+                String actual = catalog().customName(itemSnapshot);
+                trace("merge[{}] equipment name after merge: '{}' (template '{}')", operationIndex, actual,
+                    desiredRename());
+                // Visible proof that the name field was really written on this merge: the piece's own name is the
+                // template name again. If it is not, the end-of-piece rename pass still writes it, at a higher price.
+                if (desiredRename() != null && !desiredRename().isEmpty() && !desiredRename().equals(actual)) {
+                    trace("merge[{}] result came back without the template name; the rename pass will write it",
+                        operationIndex);
+                }
+            }
             operationIndex++;
             takeAttempts = 0;
             transientRetries = 0;
@@ -3358,6 +3679,22 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
+     * Carried stacks of the job's item that already wear {@code name}. Used as the baseline of a rename pass: the pass
+     * only succeeded when this count grows, because a batch carries several identical pieces.
+     */
+    private int countNamedStacks(String name) {
+        if (name == null || name.isEmpty()) return 0;
+        int itemId = configuredItemId();
+        int count = 0;
+        for (int slot = 9; slot <= 44; slot++) {
+            ItemStack stack = playerItem(slot);
+            if (stack == null || stack.getId() != itemId) continue;
+            if (name.equals(catalog().customName(stack))) count++;
+        }
+        return count;
+    }
+
+    /**
      * Locates the renamed equipment in the BOT inventory by enchantItem id, exact name (an empty name means the item
      * has none) and its enchantments, so a look-alike stack is never mistaken for the one that was just renamed.
      */
@@ -3455,9 +3792,14 @@ public class AutoEnchantModule extends Module {
         // The same job, not merely the same item: two jobs can share an item type (and even a target set) while
         // pointing at different output chests, and a batch must never file one job's products into the other's chest.
         if (runnableJobFor(stack).orElse(null) != target) return false;
-        // A return trip takes every RAW piece of the job; a flush/batch unload takes every FINISHED piece.
+        // A return trip takes every RAW piece of the job; a flush/batch unload takes every piece that is DONE - the
+        // target enchantments AND the template name. Depositing on the enchantments alone filed nine unnamed swords
+        // into the output chest next to the one piece the rename pass had just named.
         if (returningExcessInput) return catalog().enchantments(stack).isEmpty();
-        return catalog().enchantments(stack).equals(targetEnchants);
+        // A rename the anvil refused (cost past the limit) is given up on for this piece: it leaves unnamed rather
+        // than holding the whole batch in the bag forever.
+        if (renameGivenUp && itemSnapshot != null && sameStackIdentity(itemSnapshot, stack)) return true;
+        return isDeliverable(target, stack);
     }
 
     private void verifyUnloaded() {
@@ -3465,6 +3807,14 @@ public class AutoEnchantModule extends Module {
         if (remaining.isEmpty()) {
             outputStored = true;
             trace("deposit confirmed: {} stack(s) left the inventory", depositSlots.size());
+            // A step-wise batch completes most of its pieces inside the batch loop, but the piece that closes the
+            // batch never passes through that loop - it is the one that hands the workflow to this unload. Left to
+            // the single completion log the batch reported "1 piece(s)" while the chest received ten. The deposit is
+            // the honest count, so whatever the completion log did not count is added here.
+            if (!flushing && !returningExcessInput && batchJob != null) {
+                int uncounted = depositSlots.size() - stats.batchPieces;
+                if (uncounted > 0) recordPiecesDone(uncounted);
+            }
             state = State.CLOSE_OUTPUT;
             return;
         }
@@ -3649,8 +3999,12 @@ public class AutoEnchantModule extends Module {
 
     /** Growing pause between transient retries, capped so a healthy item is not stalled for minutes. */
     private long retryDelayMs() {
-        long base = Math.max(1_000L, AutoEnchantPlugin.PLUGIN_CONFIG.restartDelay * 50L);
-        return Math.min(30_000L, base * Math.max(1, Math.min(transientRetries, 5)));
+        // The pause is there to let one bad packet settle, not to slow the batch down. It used to start at a full
+        // second whatever restartDelay said, and grow to half a minute; at 15s per piece that was a whole piece's
+        // worth of standing still after three retries. It now starts at restartDelay (one client use-cooldown by
+        // default) and only the repeats grow, with a much lower ceiling so a stubborn step surfaces quickly.
+        long base = Math.max(200L, AutoEnchantPlugin.PLUGIN_CONFIG.restartDelay * 50L);
+        return Math.min(5_000L, base * Math.max(1, Math.min(transientRetries, 5)));
     }
 
     /** Counts consecutive failures for the current enchantItem; a repeated offender is parked for a while. */
@@ -3810,17 +4164,56 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
-     * Budget for an anvil result to reach the BOT inventory after the output slot was clicked. The result travels as
-     * a separate slot update, so this is deliberately more generous than a plain interaction: a short wait here used
-     * to look like a failed enchant even though the merge had gone through on the server.
+     * Budget for an anvil result (or a picked-up output) to arrive, i.e. for one server round trip.
+     *
+     * <p>Kept short on purpose: an anvil that was used up produces no preview at all, and waiting seconds on it only
+     * delays the replacement. A result that really is late is retried - {@code keepAndRetry} keeps the item and the
+     * merge is attempted again - so a short budget costs one round trip, never an item.
      */
     private long awaitResultMs() {
-        return Math.max(3_000L, awaitIntactMs());
+        return Math.max(1_500L, awaitIntactMs());
     }
 
     /** Interaction budget in ticks; the trader's own timeout setting drives the timers below. */
     private long interactTimeoutTicks() {
         return Math.max(1L, AutoEnchantPlugin.PLUGIN_CONFIG.waitForInteractTimeoutTicks);
+    }
+
+    /**
+     * Budget for one open click before it is re-sent: four ticks (one client use-cooldown), then the full interaction
+     * budget for a block that keeps refusing.
+     *
+     * <p>Measured: at this server nearly every open misses once and the re-sent click opens the window in the same
+     * second, whether the budget was 5, 10 or 20 ticks. So the first click is not slow, it is dropped - the BOT has
+     * just walked up and its position has not reached the server yet. Waiting the full budget only adds dead time on
+     * every chest and anvil (36 opens a batch); four ticks covers the position round trip, and a block that really
+     * cannot be opened still falls back to the long budget so it is not hammered.
+     */
+    private long openRetryTicks() {
+        return openClickMisses <= 2 ? 4L : interactTimeoutTicks();
+    }
+
+    /** Counts an open click that produced no window, starting over when the block being opened is a different one. */
+    private void noteOpenClickMiss() {
+        boolean sameSpot = openMissPosition != null && openingPosition != null
+            && openMissPosition.x() == openingPosition.x() && openMissPosition.y() == openingPosition.y()
+            && openMissPosition.z() == openingPosition.z();
+        if (!sameSpot) {
+            openClickMisses = 0;
+            openMissPosition = openingPosition;
+        }
+        openClickMisses++;
+        if (openClickMisses == 1) {
+            // Distance is printed because a click that is out of reach is dropped silently by the server, and these
+            // misses are frequent enough that the cause has to be visible in the log rather than guessed.
+            var player = CACHE.getPlayerCache().getThePlayer();
+            double dist = player == null ? -1
+                : Math.sqrt(Math.pow(player.getX() - (openingPosition.x() + 0.5), 2)
+                    + Math.pow(player.getY() - openingPosition.y(), 2)
+                    + Math.pow(player.getZ() - (openingPosition.z() + 0.5), 2));
+            trace("no window after clicking {} within {} tick(s); re-sending the click (distance {})", openingPosition,
+                openRetryTicks(), String.format("%.2f", dist));
+        }
     }
 
     /** Round-trip budget in ticks, rounded up from {@link #awaitResultMs()} so a wait never fires early. */
@@ -3945,10 +4338,17 @@ public class AutoEnchantModule extends Module {
             openingPosition = anvilPosition;
             // The plan already knows what the next merge costs, so the level is farmed before the anvil is opened
             // instead of opening it, seeing too little, closing it again and only then farming. The anvil's own cost
-            // line stays authoritative as a verification (see verifyAnvilPreview).
-            int planned = plannedCostOf(operationIndex);
-            if (planned > 0) waitingCost = planned;
-            if (planned > 0 && !ensureXpForCost(planned)) {
+            // line stays authoritative as a verification (see verifyAnvilPreview). The budget carries the gap this
+            // server was seen charging above the plan, so the verification does not turn into a round trip.
+            //
+            // Budgeted over everything this piece still has to merge, not just the next merge: one farm trip that
+            // covers the whole piece replaces the "merge, run dry, close the window, fight, reopen, merge again"
+            // loop that a per-merge budget produced (a merge that costs 3 leaves 11 of 14 missing for the next one).
+            // refillBudget is the same number the in-window gates use, so a piece that starts short is topped up once
+            // no matter which gate noticed it.
+            int budget = refillBudget(0);
+            if (budget > 0) waitingCost = budget;
+            if (budget > 0 && !ensureXpForCost(budget)) {
                 state = State.WAIT_XP;
                 return;
             }
@@ -4043,21 +4443,38 @@ public class AutoEnchantModule extends Module {
         clearAllPathFutures();
         anvilBlockCraftFuture = BARITONE.placeBlock(anvilPosition.x(), anvilPosition.y(), anvilPosition.z(), ItemRegistry.ANVIL);
         waitForInteractTimer.reset();
+        anvilPlacementAt = System.currentTimeMillis();
+        anvilClickAt = 0;
         setWorkflowStatus("Placing an anvil at " + anvilPosition);
         state = State.AWAIT_CRAFT_ANVIL_BLOCKS;
     }
 
+    /**
+     * Waits for a placement that is already in flight. The block itself is the ground truth; the request future only
+     * says whether the click has been dispatched yet.
+     *
+     * <p>Two clocks, because two different things can be slow. While the click is not out yet the bot may still be
+     * walking or turning towards the station, and that time must not eat the confirmation budget - otherwise a long
+     * approach makes the module call a failure and re-place a block that was about to land. Once the click is out the
+     * block only appears after the server's block update arrives, which lags behind a burst of entity packets.
+     */
     private void waitForPlacement() {
-        // The world cache can lag behind a placement that the server already accepted, especially while a kill window
-        // is churning hundreds of entities. The block is the ground truth: keep polling it until the timer runs out
-        // rather than trusting a rejected pathing future that only means Baritone gave up on its approach.
         if (isAnvilBlock(anvilPosition)) {
             anvilRecoveryAttempts = 0;
+            anvilClickAt = 0;
             setWorkflowStatus("Anvil placed at " + anvilPosition);
             state = State.CHECK_ANVIL;
             return;
         }
-        if (waitForInteractTimer.tick(interactTimeoutTicks())) anvilPlacementFailed();
+        long now = System.currentTimeMillis();
+        if (!anvilBlockCraftFuture.isCompleted()) {
+            if (now - anvilPlacementAt >= ANVIL_PLACEMENT_DISPATCH_MS) anvilPlacementFailed();
+            return;
+        }
+        if (anvilClickAt == 0) anvilClickAt = now;
+        // A rejected future is no proof that the block is missing: the click can have gone out just before the process
+        // lost control, so both outcomes get the same short confirm window and only the block read decides.
+        if (System.currentTimeMillis() - anvilClickAt >= ANVIL_PLACEMENT_CONFIRM_MS) anvilPlacementFailed();
     }
 
     /**
@@ -4068,6 +4485,7 @@ public class AutoEnchantModule extends Module {
      */
     private void anvilPlacementFailed() {
         anvilBlockCraftFuture = RequestFuture.rejected;
+        anvilClickAt = 0;
         if (countStacks(ItemRegistry.ANVIL) > 0 && anvilRecoveryAttempts < MAX_ANVIL_RECOVERY) {
             anvilRecoveryAttempts++;
             trace("anvil did not appear after placement; re-placing from the bag ({}/{})",
@@ -4108,7 +4526,7 @@ public class AutoEnchantModule extends Module {
         }
         // Keep one batch of raw pieces; only the surplus is safe to send back. With a healthy bag nothing is surplus
         // and this path is a no-op - the over-filled bag is the only thing that reaches it.
-        if (raw.size() <= Math.max(1, PLUGIN_CONFIG.inputItemRestockStacks)) return false;
+        if (raw.size() <= Math.max(1, PLUGIN_CONFIG.batchSize)) return false;
         int slot = raw.getFirst();
         ItemStack stack = playerItem(slot);
         playerSlot = slot;
@@ -4184,7 +4602,11 @@ public class AutoEnchantModule extends Module {
             var job = runnableJobFor(stack);
             if (job.isEmpty() || job.get() != target) continue;
             if (isCoolingDown(stack) || catalog().hasCurse(stack)) continue;
-            if (normalizedEnchants(stack).equals(targetEnchants)) continue;
+            // A piece whose enchantments are complete but whose name is not is still pending: it needs the rename
+            // pass before it may leave the bag, and counting it as done is what unloaded nine unnamed swords. A piece
+            // whose rename the anvil refused past the limit is given up on instead - it must not hold the batch.
+            if (isDeliverable(target, stack)) continue;
+            if (renameGivenUp && itemSnapshot != null && sameStackIdentity(itemSnapshot, stack)) continue;
             count++;
         }
         return count;
@@ -4193,10 +4615,10 @@ public class AutoEnchantModule extends Module {
     /**
      * True when the piece in hand already carries its job's whole target set, i.e. its last merge step is done. In row
      * order that is the end of the piece; in step order an intermediate step leaves the piece unfinished in the bag.
+     * The name counts too: a piece that still has to be renamed has not finished its work.
      */
     private boolean pieceFinished() {
-        return itemSnapshot != null && normalizedEnchants(itemSnapshot).equals(targetEnchants)
-            && !targetEnchants.isEmpty();
+        return itemSnapshot != null && !targetEnchants.isEmpty() && isDeliverable(target, itemSnapshot);
     }
 
     /**
@@ -4220,6 +4642,26 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
+     * Lifts the transient retry cooldown from every carried piece of {@code job}. Used only when a restock finds the
+     * bag already full of this job's pieces: those cooling half-done swords must become workable again or the picker
+     * would neither resume them (they are cooling) nor fetch new ones (the batch quota is already met), dead-locking
+     * the bag. Enchanting can then resume from the most backward piece via {@link #findCarriedEquipment()}.
+     */
+    private int clearCooldownForCarriedJob(AutoEnchantConfig.Enchant job) {
+        if (job == null) return 0;
+        int cleared = 0;
+        for (int slot = 9; slot <= 44; slot++) {
+            ItemStack stack = playerItem(slot);
+            if (stack == null || stack.getId() != configuredItemId()) continue;
+            var carried = runnableJobFor(stack);
+            if (carried.isEmpty() || carried.get() != job) continue;
+            String key = identityKey(stack);
+            if (skipUntil.remove(key) != null) cleared++;
+        }
+        return cleared;
+    }
+
+    /**
      * Records the batch from the pieces of {@code job} currently in the bag. Call after {@code target} is set, since
      * the batch counter is scoped to that job.
      */
@@ -4227,16 +4669,94 @@ public class AutoEnchantModule extends Module {
         if (job == null || batchJob == job) return;
         batchJob = job;
         batchPieces = countCarriedBatchPieces();
-        trace("batch recorded: {} piece(s) of {} in the bag; no new input until they are all enchanted and unloaded",
-            batchPieces, job.displayName());
+        // The first piece of a session is measured from here, not from its own completion, and the batch clock starts
+        // with the record: one piece per batch is what the per-batch stat reports.
+        noteStatsWorkStarted();
+        stats.batchStartedAt = System.currentTimeMillis();
+        stats.batchPieces = 0;
+        // The batch is what can be worked on; the raw item count can be higher when a piece is cooling down after a
+        // failed attempt, cursed, or belongs to another job of the same item. Printing both makes a short batch
+        // explainable instead of looking like a lost piece.
+        int sameItem = countCarriedById(configuredItemId());
+        trace("batch recorded: {} piece(s) of {} in the bag ({} carried of this item); no new input until they are "
+                + "all enchanted and unloaded", batchPieces, job.displayName(), sameItem);
+    }
+
+    /**
+     * Adopts finished products that sit in the bag without a batch record (process restart, plugin reload).
+     *
+     * <p>Batch membership lives in memory only, so after a restart the bag can hold a whole batch of finished pieces
+     * with nothing pointing at them. The picker then found no piece to resume, while the batch quota was already met
+     * by those very pieces - no withdrawal, no piece to enchant, no batch to unload - and the workflow bounced
+     * between the pickup chest and the entry point forever. Recording them as a batch and unloading them in one trip
+     * is what breaks that loop; the pieces stay untouched, they are only recognised as deliverables.
+     *
+     * @return true when an unload trip was started
+     */
+    private boolean adoptOrphanFinishedBatch(List<AutoEnchantConfig.Enchant> runnable) {
+        if (batchJob != null) return false;
+        for (AutoEnchantConfig.Enchant job : runnable) {
+            Map<String, Integer> wanted = targetEnchantsOf(job);
+            if (wanted.isEmpty()) continue;
+            int itemId = itemIdOf(job);
+            if (itemId < 0) continue;
+            int finished = 0;
+            for (int slot = 9; slot <= 44; slot++) {
+                ItemStack stack = playerItem(slot);
+                if (stack == null || stack.getId() != itemId) continue;
+                if (runnableJobFor(stack).orElse(null) != job) continue;
+                // Only pieces that need nothing - not even a rename - are adopted as an orphan batch. One with the
+                // wrong name is left alone: findCarriedEquipment resumes it for the rename pass, which is what the
+                // operator put it back in the chest for.
+                if (!isDeliverable(job, stack)) continue;
+                finished++;
+            }
+            if (finished == 0) continue;
+            target = job;
+            targetEnchants = wanted;
+            openBatch(job);
+            if (beginBatchUnload()) {
+                trace("orphan batch adopted: {} finished piece(s) of {} were left in the bag without a batch record; "
+                    + "unloading them before fetching new input", finished, job.displayName());
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Releases the batch latch once every piece of it has left the inventory. */
     private void closeBatch() {
         if (batchJob == null) return;
         trace("batch released: {} piece(s) of {} finished and unloaded", batchPieces, batchJob.displayName());
+        recordBatchDone();
         batchJob = null;
         batchPieces = 0;
+    }
+
+    /**
+     * Closes the throughput record of one batch: its wall clock from the record to the last unloaded piece, the pieces
+     * it really produced and the rate that follows from the two.
+     *
+     * <p>{@code batchPieces} is what the bag held when the batch was recorded, which is not the output: pieces can
+     * fail, be parked or be dropped. The counter incremented on every completion is the honest number.
+     */
+    private void recordBatchDone() {
+        if (stats.batchStartedAt == 0 || stats.batchPieces <= 0) {
+            stats.batchStartedAt = 0;
+            stats.batchPieces = 0;
+            return;
+        }
+        long ms = Math.max(0L, System.currentTimeMillis() - stats.batchStartedAt);
+        int pieces = stats.batchPieces;
+        stats.batchesDone++;
+        stats.batchPiecesTotal += pieces;
+        stats.batchTotalMs += ms;
+        stats.batchBestMs = stats.batchBestMs == 0 ? ms : Math.min(stats.batchBestMs, ms);
+        stats.batchWorstMs = Math.max(stats.batchWorstMs, ms);
+        info("stats: batch #{} done: {} piece(s) in {} ({} per piece)", stats.batchesDone, pieces,
+            secs(ms), secs(ms / Math.max(1, pieces)));
+        stats.batchStartedAt = 0;
+        stats.batchPieces = 0;
     }
 
     /**
@@ -4253,7 +4773,11 @@ public class AutoEnchantModule extends Module {
         for (int slot = 9; slot <= 44; slot++) {
             ItemStack stack = playerItem(slot);
             if (stack == null || runnableJobFor(stack).orElse(null) != batchJob) continue;
-            if (!catalog().enchantments(stack).equals(wanted)) continue;
+            // Only deliverable pieces (target set + template name) leave the bag: one that still needs its rename
+            // stays behind and is handled by the rename pass instead of being unloaded unnamed. A rename the anvil
+            // refused past the level limit is the one exception - it goes out unnamed rather than blocking the batch.
+            if (!isDeliverable(batchJob, stack)
+                && !(renameGivenUp && itemSnapshot != null && sameStackIdentity(itemSnapshot, stack))) continue;
             finished.add(slot);
         }
         if (finished.isEmpty()) return false;
@@ -4433,6 +4957,11 @@ public class AutoEnchantModule extends Module {
      */
     private void logTransaction(boolean succeeded) {
         if (target == null || itemSnapshot == null) return;
+        // Same trigger as the completion log: the piece really left the enchant queue, so throughput is measured here.
+        // Flushes and excess-input returns never reach this call, they only moved an item and produced nothing.
+        // A batch unload is counted at the deposit instead (see verifyUnloaded): it carries the whole batch, not the
+        // one piece this transaction happens to hold.
+        if (succeeded && !batchUnload) recordPieceDone();
         String duration = MathHelper.formatDuration(Duration.ofMillis(
             Math.max(0L, System.currentTimeMillis() - transactionStartedAt)));
         int levels = Math.max(0, preEnchantExpCount - carriedLevel());
@@ -4453,6 +4982,161 @@ public class AutoEnchantModule extends Module {
             info("Enchant failed: {} [{}] in {} ({} levels spent): {}", describeItem(itemSnapshot),
                 targetEnchantmentsText(), duration, levels, String.valueOf(failureReason));
         }
+    }
+
+    // ------------------------------------------------------------------ throughput statistics
+
+    /**
+     * Starts the clock for the first piece of a session.
+     *
+     * <p>Called when a batch is recorded, so the first piece is measured from the moment work started instead of
+     * counting as zero seconds. Later batches leave the clock alone: pieces follow each other without a pause.
+     */
+    private void noteStatsWorkStarted() {
+        if (stats.lastAt != 0) return;
+        stats.lastAt = System.currentTimeMillis();
+        stats.boxStartedAt = stats.lastAt;
+    }
+
+    /**
+     * Counts one finished piece: the interval since the previous completion plus the rolling 27-piece shulker box.
+     *
+     * <p>The interval is the honest per-piece number for this workflow. A batch is enchanted step by step, so all ten
+     * pieces share the same anvil windows and no single piece owns a wall-clock span of its own; the completion rate
+     * is what a full box is actually measured against.
+     */
+    private void recordPieceDone() {
+        long now = System.currentTimeMillis();
+        if (stats.lastAt == 0) noteStatsWorkStarted();
+        countPiece(Math.max(0L, now - stats.lastAt));
+        stats.lastAt = now;
+    }
+
+    /**
+     * Counts {@code n} pieces that finished together, splitting the interval between them.
+     *
+     * <p>Used by the batch unload of a step-wise run: the pieces were enchanted interleaved, so they reach the chest
+     * at the same moment and none of them owns an interval of its own.
+     */
+    private void recordPiecesDone(int n) {
+        if (n <= 0) return;
+        long now = System.currentTimeMillis();
+        if (stats.lastAt == 0) noteStatsWorkStarted();
+        long pieceMs = Math.max(0L, now - stats.lastAt) / n;
+        for (int i = 0; i < n; i++) countPiece(pieceMs);
+        stats.lastAt = now;
+    }
+
+    /** One completion: the rolling per-piece number and the 27-piece shulker box it feeds. */
+    private void countPiece(long pieceMs) {
+        stats.pieces++;
+        stats.boxPieces++;
+        // A batch unloads once at its end, so the pieces counted here are exactly the batch's real output.
+        if (batchJob != null) stats.batchPieces++;
+        stats.lastMs = pieceMs;
+        // The very first interval of a session covers fetching and planning, not one piece, so it is left out of the
+        // averages while still counting towards the box.
+        if (stats.pieces > 1) {
+            stats.totalMs += pieceMs;
+            stats.minMs = stats.minMs == 0 ? pieceMs : Math.min(stats.minMs, pieceMs);
+            stats.maxMs = Math.max(stats.maxMs, pieceMs);
+        }
+        int measured = Math.max(0, stats.pieces - 1);
+        trace("stats: piece #{} took {} (avg {}); box #{} {}/{} after {}",
+            stats.pieces, secs(pieceMs), measured > 0 ? secs(stats.totalMs / measured) : "n/a",
+            stats.boxesDone + 1, stats.boxPieces, SHULKER_BOX_PIECES, secs(System.currentTimeMillis() - stats.boxStartedAt));
+        if (stats.boxPieces < SHULKER_BOX_PIECES) return;
+        long boxMs = Math.max(0L, System.currentTimeMillis() - stats.boxStartedAt);
+        stats.boxesDone++;
+        stats.boxTotalMs += boxMs;
+        stats.boxBestMs = stats.boxBestMs == 0 ? boxMs : Math.min(stats.boxBestMs, boxMs);
+        stats.boxWorstMs = Math.max(stats.boxWorstMs, boxMs);
+        info("stats: shulker box #{} done: {} piece(s) in {} ({} per piece)", stats.boxesDone,
+            SHULKER_BOX_PIECES, secs(boxMs), secs(boxMs / SHULKER_BOX_PIECES));
+        stats.boxPieces = 0;
+        stats.boxStartedAt = System.currentTimeMillis();
+    }
+
+    /** Drops every counter, so the next piece starts a fresh measurement. */
+    public void resetStats() {
+        stats.lastAt = 0;
+        stats.lastMs = 0;
+        stats.totalMs = 0;
+        stats.minMs = 0;
+        stats.maxMs = 0;
+        stats.pieces = 0;
+        stats.boxStartedAt = 0;
+        stats.boxPieces = 0;
+        stats.boxesDone = 0;
+        stats.boxTotalMs = 0;
+        stats.boxBestMs = 0;
+        stats.boxWorstMs = 0;
+        stats.batchStartedAt = 0;
+        stats.batchPieces = 0;
+        stats.batchesDone = 0;
+        stats.batchPiecesTotal = 0;
+        stats.batchTotalMs = 0;
+        stats.batchBestMs = 0;
+        stats.batchWorstMs = 0;
+    }
+
+    /** Counter view for the {@code autoEnchant stats} command, in display order. */
+    public Map<String, String> statsFields() {
+        Map<String, String> fields = new LinkedHashMap<>();
+        int measured = Math.max(0, stats.pieces - 1);
+        long avg = measured > 0 ? stats.totalMs / measured : 0;
+        fields.put("Pieces done", Integer.toString(stats.pieces));
+        fields.put("Per piece (avg)", avg > 0 ? secs(avg) : "n/a");
+        fields.put("Per piece (fast/slow)",
+            measured > 0 ? secs(stats.minMs) + " / " + secs(stats.maxMs) : "n/a");
+        fields.put("Last piece", stats.pieces > 0 ? secs(stats.lastMs) : "n/a");
+        fields.put("Throughput", avg > 0
+            ? Math.round(3_600_000.0 / avg) + " pieces/hour (" + String.format(Locale.ROOT, "%.1f", 60_000.0 / avg)
+                + " pieces/minute)"
+            : "n/a");
+        long boxElapsed = stats.boxPieces > 0 ? Math.max(0L, System.currentTimeMillis() - stats.boxStartedAt) : 0L;
+        fields.put("Current box", stats.boxPieces + "/" + SHULKER_BOX_PIECES
+            + (stats.boxPieces > 0 ? " pieces, " + secs(boxElapsed) + " so far" : " pieces"));
+        fields.put("Boxes done", Integer.toString(stats.boxesDone));
+        if (stats.boxesDone > 0) {
+            long boxAvg = stats.boxTotalMs / stats.boxesDone;
+            fields.put("Shulker box (avg)", secs(boxAvg) + " for " + SHULKER_BOX_PIECES + " pieces ("
+                + secs(boxAvg / SHULKER_BOX_PIECES) + " per piece)");
+            fields.put("Box (fast/slow)", secs(stats.boxBestMs) + " / " + secs(stats.boxWorstMs));
+            fields.put("Boxes per hour", String.format(Locale.ROOT, "%.1f", 3_600_000.0 / boxAvg));
+        }
+        fields.put("Batches done", Integer.toString(stats.batchesDone));
+        if (stats.batchesDone > 0) {
+            long batchAvg = stats.batchTotalMs / stats.batchesDone;
+            long batchPiecesAvg = stats.batchPiecesTotal / stats.batchesDone;
+            fields.put("Batch (avg)", secs(batchAvg) + " for " + batchPiecesAvg + " piece(s) ("
+                + secs(batchAvg / Math.max(1, batchPiecesAvg)) + " per piece)");
+            fields.put("Batch (fast/slow)", secs(stats.batchBestMs) + " / " + secs(stats.batchWorstMs));
+        }
+        if (stats.batchPieces > 0) {
+            fields.put("Batch in progress", stats.batchPieces + " piece(s) done, "
+                + secs(Math.max(0L, System.currentTimeMillis() - stats.batchStartedAt)) + " so far");
+        }
+        return fields;
+    }
+
+    /** Millisecond duration as seconds with one decimal, e.g. {@code 12.4s}. */
+    private static String secs(long ms) {
+        return String.format(Locale.ROOT, "%.1fs", ms / 1000.0);
+    }
+
+    /** One-line throughput summary for the status panel. */
+    public String statsSummary() {
+        int measured = Math.max(0, stats.pieces - 1);
+        if (measured <= 0) return "no finished piece yet";
+        long avg = stats.totalMs / measured;
+        long boxAvg = stats.boxesDone > 0 ? stats.boxTotalMs / stats.boxesDone : 0L;
+        long batchAvg = stats.batchesDone > 0 ? stats.batchTotalMs / stats.batchesDone : 0L;
+        return secs(avg) + "/piece (" + Math.round(3_600_000.0 / avg) + "/hour)"
+            + (batchAvg > 0 ? ", batch " + secs(batchAvg) + " x"
+                + (stats.batchPiecesTotal / stats.batchesDone) : "")
+            + (boxAvg > 0 ? ", 27-piece box " + secs(boxAvg) : "")
+            + (stats.boxPieces > 0 ? ", box in progress " + stats.boxPieces + "/" + SHULKER_BOX_PIECES : "");
     }
 
     /**
@@ -4481,7 +5165,7 @@ public class AutoEnchantModule extends Module {
         int count = 0;
         for (int slot = 9; slot <= 44; slot++) {
             ItemStack stack = playerItem(slot);
-            if (stack != null && catalog().enchantments(stack).equals(wanted)) count++;
+            if (isDeliverable(job, stack)) count++;
         }
         return count;
     }
@@ -4522,16 +5206,24 @@ public class AutoEnchantModule extends Module {
         anvilBlockCraftFuture = RequestFuture.rejected;
         waitForInteractTimer.reset(); waitForActionTimer.reset(); waitForRestockTimer.reset();
         anvilPosition = null; anvilRecoveryAttempts = 0; targetEnchants = Map.of();
+        anvilPlacementAt = 0; anvilClickAt = 0;
         stationRecoveryOnly = false;
         activePreset = null;
         renamePass = false;
         renameTries = 0;
         renameGivenUp = false;
+        namedBeforeRename = 0;
+        renameSentThisMerge = false;
+        renameMergeRefusals = 0;
+        renameOnMergeDisabled = false;
+        anvilNameFieldDirty = false;
         backToBooks = false;
         stepLogged = false;
         origin = Origin.NONE;
         openingPosition = null;
         openState = State.ENTRYPOINT;
+        openClickMisses = 0;
+        openMissPosition = null;
         afterInventoryState = State.ENTRYPOINT; afterCloseState = State.ENTRYPOINT;
         waitingCost = 0;
         transactionStartedAt = 0;
@@ -4550,6 +5242,7 @@ public class AutoEnchantModule extends Module {
         takeAttempts = 0;
         restockItemId = -1;
         restockBefore = 0;
+        restockWanted = 0;
         windowSettlePending = false; windowSettledUntil = 0;
     }
 
@@ -4711,12 +5404,39 @@ public class AutoEnchantModule extends Module {
             if (stack == null) continue;
             var job = runnableJobFor(stack);
             if (job.isEmpty()) continue;
-            Map<String, Integer> wanted = targetEnchantsOf(job.get());
-            if (wanted.isEmpty()) continue;
-            if (!catalog().enchantments(stack).equals(wanted)) continue;
+            // "Finished" means deliverable: the target set AND the template name. A piece still waiting for its
+            // rename must not be unloaded by the bag-space flush.
+            if (!isDeliverable(job.get(), stack)) continue;
             return slot;
         }
         return -1;
+    }
+
+    /**
+     * True when this piece needs no work at all: it already carries the job's target enchantments AND the name the
+     * job asks for.
+     *
+     * <p>A finished piece with the wrong name is deliberately <em>not</em> deliverable. Those pieces are put back
+     * into an input chest by hand (an old batch that lost its name), and treating them as "done" is what produced an
+     * endless pickup loop: nothing to resume, no quota left to fetch, and no batch to unload. They are taken in
+     * instead, renamed through a rename-only anvil pass (their plan is empty, so no merge is replayed) and unloaded
+     * with the batch.
+     */
+    private boolean isDeliverable(AutoEnchantConfig.Enchant job, ItemStack stack) {
+        if (job == null || stack == null) return false;
+        int itemId = itemIdOf(job);
+        if (itemId < 0 || stack.getId() != itemId) return false;
+        if (!PLUGIN_CONFIG.renameOnly) {
+            Map<String, Integer> wanted = targetEnchantsOf(job);
+            if (wanted.isEmpty()) return false;
+            if (!catalog().enchantments(stack).equals(wanted)) return false;
+        }
+        String wantedName = job.renameName == null ? null : job.renameName.trim();
+        // No name configured: the enchanted piece is the deliverable, exactly as before.
+        if (wantedName == null) return true;
+        String currentName = catalog().customName(stack);
+        // An empty template name means "clear it", so any leftover name still needs the anvil.
+        return wantedName.isEmpty() ? currentName.isEmpty() : wantedName.equals(currentName);
     }
 
     /** The configured target set of one job in the short-id form the planner compares against. */
@@ -4800,6 +5520,13 @@ public class AutoEnchantModule extends Module {
         var data = ItemRegistry.REGISTRY.get(EnchantPresetCatalog.shortId(target.item));
         return data == null ? -1 : data.id();
     }
+
+    /** Registry id of a configured job's item, independent of {@code target}; -1 when the id is unknown. */
+    private int itemIdOf(AutoEnchantConfig.Enchant job) {
+        if (job == null || job.item == null) return -1;
+        var data = ItemRegistry.REGISTRY.get(EnchantPresetCatalog.shortId(job.item));
+        return data == null ? -1 : data.id();
+    }
     /** Full registry id the preset catalog expects, e.g. {@code diamond_sword} -> {@code minecraft:diamond_sword}. */
     private String fullItemId(String item) {
         return item == null || item.isBlank() ? "" : "minecraft:" + EnchantPresetCatalog.shortId(item);
@@ -4869,14 +5596,14 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
-     * Level cost the plan expects for merge {@code index}, including the one extra level the anvil charges for the
-     * rename that rides on that merge. This is the number a merge is budgeted with before the anvil is opened; the
-     * window's own cost line only verifies it.
+     * Level cost the plan expects for merge {@code index}, including the one extra level the anvil charges for a merge
+     * that really writes the piece's name (see {@link #renameAppliesTo(int)}). This is the number a merge is budgeted
+     * with before the anvil is opened; the window's own cost line only verifies it.
      */
     private int plannedCostOf(int index) {
         if (index < 0 || index >= operations.size()) return 0;
         int cost = operations.get(index).expectedCost();
-        if (index == renameOperationIndex() && needsRename()) cost += 1;
+        if (renameAppliesTo(index)) cost += 1;
         return Math.max(0, cost);
     }
 
@@ -4885,6 +5612,42 @@ public class AutoEnchantModule extends Module {
         int total = 0;
         for (int i = 0; i < operations.size(); i++) total += plannedCostOf(i);
         return total;
+    }
+
+    /**
+     * Levels the plan still expects to spend from merge {@code index} to the end of the piece.
+     *
+     * <p>This is the number the level is farmed to before an anvil is opened: the merges of one piece run back to
+     * back - often inside a single anvil window - so farming only the next merge's cost leaves the window short after
+     * the first merge and forces it closed again for a second trip (a 14-level plan became 3 + 11 in two fights).
+     */
+    private int plannedRemainingCostOf(int index) {
+        int total = 0;
+        for (int i = Math.max(0, index); i < operations.size(); i++) total += plannedCostOf(i);
+        return total;
+    }
+
+    /**
+     * Level to hold before the rest of this piece can be merged, i.e. every merge still ahead plus the gap this server
+     * has been seen charging above the plan.
+     *
+     * <p>Every gate that discovers the level is short farms this number, not the price of the one merge that tripped
+     * it. A 14-level piece is a 3-level book merge followed by an 11-level equipment merge: gating on the failing merge
+     * alone sent the BOT out for 3 levels, back to the anvil, and out again for 11 - two trips, two window closes and
+     * two walks for the same 14 levels. The total is unchanged; only the number of round trips is.
+     *
+     * @param atLeast a level the caller already knows is needed (the anvil's own cost line), so an under-planned merge
+     *                is still covered
+     */
+    private int refillBudget(int atLeast) {
+        int planned = plannedRemainingCostOf(operationIndex);
+        if (renamePass && itemSnapshot != null) {
+            // A rename-only pass has no merge to budget by: the anvil charges one level plus the piece's whole
+            // prior-work penalty (a finished sword pays ~16, not 1).
+            planned = Math.max(planned, catalog().priorWorkPenalty(itemSnapshot) + 1);
+        }
+        if (planned > 0) planned += planCostBias;
+        return Math.max(planned, atLeast);
     }
 
     /** Full plan dump: the tree the preset (or planner) produced and every merge it will perform. */
@@ -4900,31 +5663,36 @@ public class AutoEnchantModule extends Module {
         lastPlanSignature = signature;
         trace("plan preset={} books={} merges={} target={}", activePreset == null ? "custom" : activePreset,
             books.size(), operations.size(), describeEnchants(targetEnchants));
-        trace("plan budget: about {} levels for this piece (farmed up front, the anvil only verifies)", plannedLevels());
+        trace("plan budget: about {} levels for this piece (farmed up front, the anvil only verifies{}); levels are "
+                + "spent cumulatively, so the column below is the level this piece needs in hand before merge[i]",
+            plannedLevels(), planCostBias > 0 ? ", +" + planCostBias + " safety over the plan" : "");
+        int cumulative = 0;
         for (int i = 0; i < operations.size(); i++) {
             var op = operations.get(i);
             // The planned cost is the wiki's number for this merge (enchantment value + both prior-work penalties),
-            // so a plan that would run into the 39-level limit is visible before any XP is spent. The merge that
-            // carries the name costs one level more: the anvil charges renaming on top of the merge itself, and that
-            // is exactly the level the BOT has to have in hand for that step.
-            int planned = op.expectedCost() + (i == renameOperationIndex() && needsRename() ? 1 : 0);
-            trace("  merge[{}] {} + {} => {} (~{} levels{})", i, describeNode(op.left()), describeNode(op.right()),
-                describeNode(op.result()), planned, i == renameOperationIndex() && needsRename() ? ", name +1" : "");
+            // so a plan that would run into the 39-level limit is visible before any XP is spent. Only the equipment
+            // merge that really renames the piece costs one level more: the later merges re-send the name so the
+            // server keeps it, but writing a name the piece already has is free.
+            int planned = op.expectedCost() + (renameAppliesTo(i) ? 1 : 0);
+            cumulative += planned;
+            trace("  merge[{}] {} + {} => {} (~{} levels, {} cumulative{})", i, describeNode(op.left()),
+                describeNode(op.right()), describeNode(op.result()), planned, cumulative,
+                renameAppliesTo(i) ? ", name +1" : "");
         }
         for (int i = 0; i < books.size(); i++) {
             trace("  book[{}] {} {}", i, books.get(i).id(), books.get(i).level());
         }
-        // The name is written into the anvil's name field together with the inputs of the first merge that involves
-        // the equipment, so the renamed piece climbs the rest of the tree and the rename never adds its cost to an
-        // already expensive merge.
+        // The name is written on the FIRST merge that touches the equipment - a fresh piece pays one level there -
+        // and re-sent on every later equipment merge (free) so each rebuilt result keeps its custom name.
         String name = desiredRename();
         if (name != null) {
-            int renameAt = renameOperationIndex();
-            trace("  name field '{}' rides on merge[{}]{} (already applied: {})",
+            int renameAt = firstEquipmentMerge();
+            trace("  name field '{}' is written on merge[{}]{} (+1 level there only) and re-sent on every later "
+                    + "equipment merge (piece '{}', template '{}')",
                 name.isEmpty() ? "(clear)" : name, renameAt,
                 renameAt < 0 ? " - no equipment merge, a separate rename pass will run"
                     : " " + describeNode(operations.get(renameAt).result()),
-                !needsRename());
+                itemSnapshot == null ? "" : catalog().customName(itemSnapshot), target.renameName);
         }
     }
 
