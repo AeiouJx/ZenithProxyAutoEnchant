@@ -45,9 +45,11 @@ public class AutoEnchantCommand extends Command {
                 "waitForInteractTimeout <ticks>",
                 "actionDelay <ticks>",
                 "restartDelay <ticks>",
+                "openRetry <ticks>",
                 "experienceSource <none/kill/exp>",
                 "logTradeStatusToDiscord on/off",
                 "renameOnly on/off",
+                "grindstone <x> <y> <z>",
                 "ExpFarmSpot <x> <y> <z>",
                 "anvil <x> <y> <z>",
                 "anvilChest <x> <y> <z>",
@@ -401,6 +403,16 @@ public class AutoEnchantCommand extends Command {
                     .title("Restart Delay Set")
                     .addField("Delay", PLUGIN_CONFIG.restartDelay + " ticks before retrying after a failure");
             })))
+            .then(literal("openRetry").then(argument("ticks", time()).executes(c -> {
+                // Round trip of one open click, not the failure backoff: how long a right click on a chest / anvil /
+                // grindstone waits for the window before the click is sent again. Tune it against the
+                // "open latency ... misses" line in the log.
+                PLUGIN_CONFIG.openRetryTicks = Math.max(1, getInteger(c, "ticks"));
+                c.getSource().getEmbed()
+                    .title("Open Retry Set")
+                    .addField("Delay", PLUGIN_CONFIG.openRetryTicks + " ticks before an open click is re-sent")
+                    .addField("Note", "After 3 attempts at one block the interaction timeout takes over");
+            })))
             .then(literal("experienceSource")
                 .then(argument("source", enumStrings(AutoEnchantConfig.ExperienceSource.values())).executes(c -> {
                     var source = AutoEnchantConfig.ExperienceSource.valueOf(getString(c, "source").toUpperCase());
@@ -425,6 +437,21 @@ public class AutoEnchantCommand extends Command {
                     .addField("Mode", PLUGIN_CONFIG.renameOnly
                         ? "items are only renamed; no enchantment is applied"
                         : "items are enchanted to their target set", false);
+            })))
+            .then(literal("grindstone").then(argument("grindstonePos", blockPos()).executes(c -> {
+                // Where a piece carrying enchantments outside the target is ground blank. The block has to be a real
+                // grindstone when a piece needs cleaning; the position is checked before every open, so a missing block
+                // costs one warning and a backoff instead of a tick-rate retry loop.
+                var grindstonePos = getBlockPos(c, "grindstonePos");
+                var embed = c.getSource().getEmbed();
+                if (World.isChunkLoadedBlockPos(grindstonePos.x(), grindstonePos.z())) {
+                    embed.addField("Block At Grindstone Pos", World.getBlock(grindstonePos).name());
+                }
+                PLUGIN_CONFIG.grindstone = grindstonePos;
+                embed.title("Grindstone Set")
+                    .addField("Position", grindstonePos)
+                    .addField("Applies", "Where an item with extra enchantments is cleaned", false);
+                return OK;
             })))
             .then(literal("ExpFarmSpot").then(argument("ExpFarmSpot", blockPos()).executes(c -> {
                 var killSpotPos = getBlockPos(c, "ExpFarmSpot");
@@ -614,6 +641,7 @@ public class AutoEnchantCommand extends Command {
                 .addField("Wait For Interact Timeout", PLUGIN_CONFIG.waitForInteractTimeoutTicks + " ticks")
                 .addField("Action Delay", PLUGIN_CONFIG.actionDelay + " ticks")
                 .addField("Restart Delay", PLUGIN_CONFIG.restartDelay + " ticks")
+                .addField("Open Retry", PLUGIN_CONFIG.openRetryTicks + " ticks per open click")
                 .addField("Experience Source", PLUGIN_CONFIG.experienceSource.name().toLowerCase())
                 .addField("Rename Only", PLUGIN_CONFIG.renameOnly)
                 .addField("ExpFarmSpot", PLUGIN_CONFIG.ExpFarmSpot)

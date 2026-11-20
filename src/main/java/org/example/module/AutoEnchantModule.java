@@ -61,7 +61,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static com.github.rfresh2.EventConsumer.of;
 import static com.zenith.Globals.*;
@@ -118,7 +117,6 @@ public class AutoEnchantModule extends Module {
         }
     }
 
-    private static final int SCAN_INTERVAL_TICKS = 100;
     private static final int SUPPLY_SCAN_DEPTH = 8;
     /** How far above a frame the column is searched for its redstone lamp; the lamp need not touch the frame. */
     private static final int LAMP_SCAN_HEIGHT = 8;
@@ -135,7 +133,8 @@ public class AutoEnchantModule extends Module {
     private final Map<String, List<BlockPos>> stations = new LinkedHashMap<>();
     private final List<Marker> markers = new ArrayList<>();
     private final List<JobFrame> jobFrames = new ArrayList<>();
-    private final AtomicInteger tickCounter = new AtomicInteger();
+    /** Set after the one scan the module performs itself; every later scan is the scan command. */
+    private boolean scanDone;
     private volatile String status = "Not scanned";
     private volatile long lastScanAt;
     private volatile int lastAnvilContainerId = -1;
@@ -294,12 +293,15 @@ public class AutoEnchantModule extends Module {
                 .build());
         }
 
-        monitorXpFarming();
-        tick();
-        if (tickCounter.incrementAndGet() >= SCAN_INTERVAL_TICKS) {
-            tickCounter.set(0);
+        // One scan when the module starts working, then only on demand: the layout (stations, frames, markers) is
+        // re-read by the scan command, never on a timer. A periodic scan walked the world every 5s and silently
+        // rewrote the anvil and grindstone positions while the BOT worked.
+        if (!scanDone && CACHE.getPlayerCache().getThePlayer() != null) {
+            scanDone = true;
             scanNow();
         }
+        monitorXpFarming();
+        tick();
     }
 
     public synchronized void scanNow() {
@@ -700,26 +702,26 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
-     * Fills an unset anvil or grindstone with the nearest loaded block within the configured scan range. A manually
-     * configured position is never overwritten; it stays the authority even when its block is currently unloaded.
+     * Takes the nearest anvil and grindstone in the scan range as the configured stations, on every scan. A fixed
+     * position used to stay the authority forever, so moving the grindstone left the BOT clicking air until the config
+     * was edited by hand; the scan result is what the workflow now uses, and a change is logged with both positions.
+     * A range that holds no such block changes nothing - the previous position stays until one is found.
      */
     private boolean autoFillStations(AutoEnchantConfig config) {
         boolean changed = false;
-        if (isUnset(config.anvil)) {
-            BlockPos found = findNearestBlock(this::isAnvil);
-            if (found != null) {
-                config.anvil = found;
-                changed = true;
-                info("Auto-enchant: scanned anvil at {}", found);
-            }
+        BlockPos anvil = findNearestBlock(this::isAnvil);
+        if (anvil != null && !anvil.equals(config.anvil)) {
+            if (isUnset(config.anvil)) info("Auto-enchant: scanned anvil at {}", anvil);
+            else info("Auto-enchant: anvil moved, {} instead of {}", anvil, config.anvil);
+            config.anvil = anvil;
+            changed = true;
         }
-        if (isUnset(config.grindstone)) {
-            BlockPos found = findNearestBlock(id -> id == BlockRegistry.GRINDSTONE.id());
-            if (found != null) {
-                config.grindstone = found;
-                changed = true;
-                info("Auto-enchant: scanned grindstone at {}", found);
-            }
+        BlockPos grindstone = findNearestBlock(id -> id == BlockRegistry.GRINDSTONE.id());
+        if (grindstone != null && !grindstone.equals(config.grindstone)) {
+            if (isUnset(config.grindstone)) info("Auto-enchant: scanned grindstone at {}", grindstone);
+            else info("Auto-enchant: grindstone moved, {} instead of {}", grindstone, config.grindstone);
+            config.grindstone = grindstone;
+            changed = true;
         }
         return changed;
     }
@@ -728,7 +730,10 @@ public class AutoEnchantModule extends Module {
         return pos == null || BlockPos.ZERO.equals(pos);
     }
 
-    /** Nearest loaded block around the BOT that matches, or null when the scan range contains none. */
+    /**
+     * Nearest loaded block around the BOT that matches, or null when the scan range holds none. Distance is measured
+     * from the BOT, so the station that is used is always the one closest to where the work happens.
+     */
     private BlockPos findNearestBlock(java.util.function.IntPredicate match) {
         var player = CACHE.getPlayerCache().getThePlayer();
         if (player == null) return null;
@@ -1315,8 +1320,9 @@ public class AutoEnchantModule extends Module {
      * BOT has") and the kill windows that keep the silverfish farm from being culled while the BOT works. It is never
      * left on for its own sake - every window switches it off again.
      *
-     * <p>The user's own value is remembered the first time the module touches the setting and handed back by
-     * {@link #releaseKillAura()} when the module stops.
+     * <p>Only the on/off switch is touched. Attack interval, weapon switching and every other KillAura option stay
+     * exactly as the operator configured them. The user's own on/off value is remembered the first time the module
+     * takes the aura over and handed back by {@link #releaseKillAura()} when the module stops.
      */
     private synchronized void switchKillAura(boolean enabled) {
         if (CONFIG.client.extra.killAura.enabled == enabled) return;
@@ -1331,15 +1337,16 @@ public class AutoEnchantModule extends Module {
             enabled ? "killing silverfish at the exp spot" : "back to the enchant work");
     }
 
-    /** Hands the user's own KillAura setting back when this module stops driving it. */
+    /** Hands the user's own KillAura on/off setting back when this module stops driving it. */
     private synchronized void releaseKillAura() {
         if (!killAuraOwned) return;
         killAuraOwned = false;
-        if (CONFIG.client.extra.killAura.enabled == killAuraUserSetting) return;
-        CONFIG.client.extra.killAura.enabled = killAuraUserSetting;
-        KillAura killAura = MODULE.get(KillAura.class);
-        if (killAura != null) killAura.syncEnabledFromConfig();
-        info("[trace] KillAura restored to the user's setting: {}", killAuraUserSetting ? "on" : "off");
+        if (CONFIG.client.extra.killAura.enabled != killAuraUserSetting) {
+            CONFIG.client.extra.killAura.enabled = killAuraUserSetting;
+            KillAura killAura = MODULE.get(KillAura.class);
+            if (killAura != null) killAura.syncEnabledFromConfig();
+            info("[trace] KillAura restored to the user's setting: {}", killAuraUserSetting ? "on" : "off");
+        }
     }
 
     /**
@@ -1505,6 +1512,12 @@ public class AutoEnchantModule extends Module {
         RESTOCK_INPUT_WITHDRAW,
         RESTOCK_INPUT_AWAIT_WITHDRAW,
         EVAL_UNCHANT,
+        /**
+         * Batch-wide clean-up, run once per batch right after the pieces are withdrawn: every carried piece of the job
+         * is compared with the template and the ones carrying anything outside it are ground in a single grindstone
+         * window. Only then does the batch move on to its books and anvil merges.
+         */
+        BATCH_GRIND,
         RESTOCK_ANVIL_GO_TO_CHEST,
         RESTOCK_ANVIL_WITHDRAW,
         RESTOCK_ANVIL_AWAIT_WITHDRAW,
@@ -1700,11 +1713,39 @@ public class AutoEnchantModule extends Module {
     private int openClickMisses;
     /** Block the misses above were counted at, so a different chest or anvil starts with a full budget again. */
     private BlockPos openMissPosition;
+    /**
+     * When the last right click for a window actually executed, so the wait until the window arrives can be measured.
+     * The retry budget is a guess until this is known: the numbers below say how long the server really takes, which
+     * is the only way to tell a dropped click from one that simply needs another tick.
+     */
+    private long openClickAtMs;
+    /** Latency buckets of recently opened windows: <100ms, 100-150, 150-200, 200-300, >=300. */
+    private final int[] openLatencyBuckets = new int[5];
+    private int openLatencyCount;
+    private int openLatencyMaxMs;
+    private int openMissesSinceReport;
     /** The OPEN_* state a failed or stale window returns to, mirroring the trader's chest states. */
     private State openState = State.ENTRYPOINT;
     private BlockPos openingPosition;
     private String failureReason;
     private boolean grindRequired;
+    /**
+     * True while a batch-wide grind pass owns the grindstone: the window is opened once and kept open while every
+     * piece of the batch that needs cleaning is put in and taken out, instead of one window per piece.
+     */
+    private boolean batchGrindPass;
+    /** Pieces the current batch grind pass still has to clean / already cleaned, for the status line and the log. */
+    private int batchGrindTotal;
+    private int batchGrindDone;
+    /** Blank copies of the item in the bag before the grindstone result was taken, used to confirm the take. */
+    private int grindBlankBefore = -1;
+    /**
+     * The piece in hand carries a binding or vanishing curse: it is never ground, merged or renamed, only carried
+     * until the batch's single unload trip. Set when it is taken in, cleared with the transaction.
+     */
+    private boolean keepCursed;
+    /** The piece in hand already matches its target (enchantments and name): taken with the batch, out with its unload. */
+    private boolean keepDone;
     private int waitingCost;
     private BlockPos anvilPosition;
     private int anvilRecoveryAttempts;
@@ -1818,6 +1859,23 @@ public class AutoEnchantModule extends Module {
      * for {@link #flushing} to unload; the raw pieces have no work invested, so the safe exit is to put them back.
      */
     private boolean returningExcessInput;
+    /**
+     * True while enchantment books the batch no longer needs are being carried back to their book chest. Books are
+     * the one thing a batch can accumulate without bound: a step withdraws one copy per piece, a piece that fails or
+     * is unloaded early leaves its copies behind, and a bag full of leftover books then has no slot for the next
+     * withdrawal - the workflow sat there re-entering the entry point while nothing happened.
+     */
+    private boolean returningExcessBook;
+    /** Step index reported last, so the batch-frontier line appears once per step instead of once per retry. */
+    private int tracedFrontier = -1;
+    /**
+     * Slots a return-to-input trip carries back. Named explicitly instead of "every raw piece of the job" so the trip
+     * can also send back a single half-done piece when the bag has no free slot at all - the case where 10 swords plus
+     * a multi-book step can never fit in 36 slots and the workflow used to stand still forever.
+     */
+    private List<Integer> returnSlots = List.of();
+    /** Last reason a branch re-entered itself, so the idle loop is printed once instead of every tick. */
+    private String lastRetryBranch;
     /** Free player slots a transaction wants: the equipment piece itself, one book, and the anvil result. */
     private static final int FREE_SLOTS_FOR_TRANSACTION = 3;
     /**
@@ -1849,6 +1907,14 @@ public class AutoEnchantModule extends Module {
     private static final long ANVIL_PLACEMENT_CONFIRM_MS = 800L;
     /** The one genuine enchant failure: the server refuses the operation because its level cost is too high. */
     private static final int TOO_EXPENSIVE_LEVEL = 40;
+    /**
+     * Free slots a book campaign must leave untouched: one. The campaign used to spend the bag down to zero free
+     * slots, so the next book had nowhere to go and every piece of the batch parked on "BOT inventory is full" -
+     * and a single free slot is also what the merge that follows needs to put its result back into. More than one
+     * only shrinks the campaign: every slot withheld here is a book that has to be fetched in another trip, and the
+     * trips are the expensive part.
+     */
+    private static final int BOOK_FETCH_RESERVE = 1;
     /** Consecutive transient retries of the same enchantItem before it is parked in the inventory for a while. */
     private static final int MAX_TRANSIENT_RETRIES = 5;
     /** Re-clicks of an anvil result slot whose pickup click was lost in flight. */
@@ -1982,6 +2048,7 @@ public class AutoEnchantModule extends Module {
             // third open and every one after it waited the full interaction budget before clicking a second time.
             openClickMisses = 0;
             openMissPosition = null;
+            recordOpenLatency();
             // Let the server finish sending window contents before any slot is read or clicked.
             // Like the trader's playerSectionHasItems check, the player section carries data only
             // once the contents packet arrived; the timeout lets a genuinely empty inventory through.
@@ -2009,14 +2076,15 @@ public class AutoEnchantModule extends Module {
                 case RESTOCK_INPUT_WITHDRAW -> handleInputWindow();
                 case RESTOCK_INPUT_TAKE -> takeInput();
                 case RESTOCK_INPUT_AWAIT_WITHDRAW -> verifyInputTransfer();
-                case CLOSE_INPUT -> closeContainer(failureReason != null ? State.POST_ENCHANT : grindRequired ? State.EVAL_UNCHANT : State.NEXT_BOOK);
+                case CLOSE_INPUT -> closeContainer(failureReason != null ? State.POST_ENCHANT : State.BATCH_GRIND);
+                case BATCH_GRIND -> beginBatchGrind();
                 case EVAL_UNCHANT -> prepareGrindstone();
                 case GRINDSTONE_AWAIT_INTERACT -> handleGrindstoneWindow();
                 case GRINDSTONE_INSERT -> insertIntoGrindstone();
                 case GRINDSTONE_AWAIT_RESULT -> verifyGrindstonePreview();
                 case GRINDSTONE_TAKE -> takeGrindstoneResult();
                 case GRINDSTONE_AWAIT_TAKE -> verifyGrindstoneResult();
-                case GRINDSTONE_CLOSE -> closeContainer(State.NEXT_BOOK);
+                case GRINDSTONE_CLOSE -> finishGrindPass();
                 case NEXT_BOOK -> nextBook();
                 case RESTOCK_ENCHANTED_BOOK_WITHDRAW -> handleBookWindow();
                 case RESTOCK_ENCHANTED_BOOK__AWAIT_WITHDRAW -> verifyBookTransfer();
@@ -2102,6 +2170,9 @@ public class AutoEnchantModule extends Module {
         if (freeSlots < 1) {
             if (flushFinishedProduct("no free slot left in the bag")) return;
             if (flushExcessInput("no free slot left in the bag")) return;
+            // Leftover enchantment books are the usual reason a bag stays full after a batch: their swords were
+            // unloaded, the copies were not. They go back to their book chest before the branch gives up.
+            if (flushSurplusBooks("no free slot left in the bag")) return;
             // Nothing unloadable is left in the bag. Opening the pickup chest would only bounce the withdraw click off
             // a full inventory, so the bag is reported and the branch runs again on the next tick.
             retryBranch("Bag is full: no free slot for the next enchantItem");
@@ -2204,6 +2275,9 @@ public class AutoEnchantModule extends Module {
             // whose enchantments are complete but whose NAME is not is still work - it needs the rename pass.
             if (isDeliverable(job.get(), stack)) continue;
             int score = progressScore(stack);
+            // Step order works the ladder first. A piece whose carried set is no tree node walks its own plan, and
+            // adopting it while blank pieces are still one step in would let that plan drive the book campaigns.
+            if (stepOrder() && !batchAligned(stack)) score += 1000;
             if (stepOrder() ? score < bestScore : score > bestScore) { bestScore = score; bestSlot = slot; }
         }
         return bestSlot;
@@ -2235,9 +2309,15 @@ public class AutoEnchantModule extends Module {
         // that includes every other carried piece of the same job, so they are all finished before a new fetch.
         openBatch(target);
         grindRequired = false;
-        if (fromRestock && catalog().hasCurse(stack)) {
-            failureReason = "Cursed enchantItem skipped";
-            state = State.POST_ENCHANT;
+        if (isCursedPiece(stack)) {
+            // Same rule as a freshly fetched cursed piece: done on arrival, untouched in the bag, out with the batch.
+            keepCursed = true;
+            // Keep it out of the picker while the rest of the batch is worked: the piece is finished by rule, and
+            // without the cooldown the same cursed sword would be adopted again and again, stalling the batch.
+            skipUntil.put(identityKey(stack), System.currentTimeMillis() + SKIP_COOLDOWN_MS);
+            setWorkflowStatus("Cursed enchantItem kept untouched; it leaves with the batch unload");
+            trace("carried cursed piece left untouched: {}", describeItem(stack));
+            state = State.BATCH_NEXT_PIECE;
             return;
         }
         preparePlan(stack);
@@ -2255,7 +2335,10 @@ public class AutoEnchantModule extends Module {
                 parkCarried(failureReason == null ? "no merge order fits the fetched set" : failureReason);
                 return;
             }
-            state = grindRequired ? State.EVAL_UNCHANT : State.NEXT_BOOK;
+            // A rejected piece (enchantments outside the target that cannot be ground off) is unloaded like any other
+            // failed transaction instead of continuing into the merge steps.
+            state = failureReason != null ? State.POST_ENCHANT
+                : grindRequired ? State.BATCH_GRIND : State.NEXT_BOOK;
             return;
         }
         Map<String, Integer> current = catalog().enchantments(stack);
@@ -2280,9 +2363,21 @@ public class AutoEnchantModule extends Module {
             state = State.NEXT_BOOK;
             return;
         }
-        if (!withinPlan(current)) {
-            failureReason = "Carried enchantItem has enchantments outside the target";
-            markAttempt();
+        trace("reset check: {} -> {}", describeItem(stack), resetReason(stack));
+        if (needsReset(stack)) {
+            if (grindstoneUsable()) {
+                // Not one piece at a time: the whole batch is compared and cleaned in one grindstone pass, so the
+                // carried piece joins that pass instead of opening a window of its own.
+                grindRequired = true;
+                setWorkflowStatus("Carried enchantItem has extra enchantments; joining the batch's grindstone pass");
+                state = State.BATCH_GRIND;
+                return;
+            }
+            failureReason = "Carried enchantItem has enchantments outside the target and no grindstone is configured";
+            // Deliberately no markAttempt(): the rejection is final for this piece (nothing about it can change), and
+            // the attempt counter is keyed by item identity, so counting it would put every other carried piece with
+            // the same enchantments on cooldown too - which emptied the batch counter and turned the run into
+            // one-piece unload trips.
             setWorkflowStatus("Carried enchantItem does not match the target; sending it to the output container");
             state = State.POST_ENCHANT;
             return;
@@ -2295,6 +2390,30 @@ public class AutoEnchantModule extends Module {
             return;
         }
         state = State.NEXT_BOOK;
+    }
+
+    /**
+     * Whether <em>this one piece</em> has to be ground blank, decided from that piece's own enchantments and nothing
+     * else - never from what the rest of the batch looks like. A blank sword is enchanted as it is, a sword that
+     * already matches the target is unloaded, and a sword carrying only template enchantments is resumed where it
+     * stands; only a sword carrying something the template does not want (or a level above the planned one) is reset.
+     * Two swords of the same batch routinely differ here: one arrives with a bane book merged in, the next is blank.
+     */
+    private boolean needsReset(ItemStack piece) {
+        if (PLUGIN_CONFIG.renameOnly) return false;
+        Map<String, Integer> current = catalog().enchantments(piece);
+        if (current.isEmpty() || current.equals(targetEnchants)) return false;
+        return !withinPlan(current);
+    }
+
+    /** Human-readable form of the {@link #needsReset} answer, for the per-piece trace line. */
+    private String resetReason(ItemStack piece) {
+        if (PLUGIN_CONFIG.renameOnly) return "rename-only mode, enchantments are not judged";
+        Map<String, Integer> current = catalog().enchantments(piece);
+        if (current.isEmpty()) return "blank, nothing to take off";
+        if (current.equals(targetEnchants)) return "already matches the target";
+        if (withinPlan(current)) return "only template enchantments, resuming as it is";
+        return "carries " + describeEnchants(current) + " outside the target, reset needed";
     }
 
     /** True when every enchantment the enchantItem carries is part of the plan and no higher than the planned level. */
@@ -2315,6 +2434,13 @@ public class AutoEnchantModule extends Module {
             reportMissingContainer(openingPosition, containerRole(state), "about to open " + openingPosition);
             return;
         }
+        // A grindstone is not a storage container, so the check above does not cover it. Without this the path request
+        // is rejected by the pathfinder in the same tick ("No block is at ...") and the open state is re-entered at
+        // tick rate - measured 1942 round trips in under a minute - instead of waiting for the block to come back.
+        if (state == State.GRINDSTONE_GO_TO_CHEST && grindstoneMissing(openingPosition)) {
+            reportMissingGrindstone(openingPosition);
+            return;
+        }
         // One kill window before a window is opened. Book and anvil work keeps the BOT behind a container for far
         // longer than the silverfish farm tolerates, so the farm is cleared right before the pause, not after it.
         if (killWindowDue() && openContainerId() == 0 && beginKillWindow(state)) return;
@@ -2329,8 +2455,9 @@ public class AutoEnchantModule extends Module {
         windowSettlePending = true;
         // As in the trader, the window wait restarts when the click actually ran, not when the path did.
         waitForInteractTimer.reset();
+        openClickAtMs = 0;
         PathingRequestFuture path = BARITONE.rightClickBlock(openingPosition.x(), openingPosition.y(), openingPosition.z());
-        path.addExecutedListener(f -> waitForInteractTimer.reset());
+        path.addExecutedListener(f -> { waitForInteractTimer.reset(); openClickAtMs = System.currentTimeMillis(); });
         setOpenPathFuture(path);
         openPathPending = true;
         state = switch (state) {
@@ -2352,30 +2479,24 @@ public class AutoEnchantModule extends Module {
         int selected = -1;
         ItemStack chosen = null;
         AutoEnchantConfig.Enchant chosenTarget = null;
-        int skippedFinished = 0;
         for (int slot = 0; slot < top; slot++) {
             ItemStack stack = openContainer().getItemStack(slot);
             Optional<AutoEnchantConfig.Enchant> match = runnableJobFor(stack);
             if (match.isEmpty()) continue;
-            // A finished piece is a deliverable, not input: withdrawing it would only carry it through the anvil
-            // again, where every merge it needs is already applied. Such pieces reach an input chest by hand or from
-            // an earlier unload that missed its output chest, so they are skipped instead of being taken as blanks.
-            // A piece whose enchantments are complete but whose NAME is wrong is not skipped: taking it in is the
-            // only way it gets the rename pass that the operator put it there for.
-            if (isDeliverable(match.get(), stack)) {
-                skippedFinished++;
-                continue;
-            }
+            // Every piece of an enabled job is taken, whatever state it is in: blank, half enchanted, carrying
+            // enchantments outside the template, or already finished. Skipping the finished ones made a chest holding
+            // nothing but the operator's finished sword look empty, and the pickup probe then reopened the same
+            // shulker about twice a second while the sword never left it. A finished piece is taken with the batch and
+            // comes back out in the batch's single unload trip.
             selected = slot; chosen = stack; chosenTarget = match.get();
             break;
-        }
-        if (skippedFinished > 0) {
-            trace("pickup chest at {}: skipped {} finished piece(s) that already match their target",
-                openingPosition, skippedFinished);
         }
         if (selected < 0) {
             // Nothing this chest can serve. The rotation moves on at once so the next chest (and the next job) gets its
             // turn; the chest itself is entered again when the rotation comes back to it.
+            // Nothing here this time: move the rotation on and enter the branch again on the next tick. No wait, no
+            // back-off - the same rule the trade module's state machine follows, so a piece dropped into the chest is
+            // picked up the moment it appears instead of after a timer.
             BlockPos chest = openingPosition;
             enchantIterator.next();
             retryBranch("Pickup chest at " + chest + " has nothing for an enabled job");
@@ -2394,8 +2515,23 @@ public class AutoEnchantModule extends Module {
         setWorkflowStatus("Fetched " + describeItem(chosen) + " for job " + target.displayName());
         trace("fetched from slot {}: {} (job {}, penalty {})", selected, describeItem(chosen),
             target.displayName(), catalog().priorWorkPenalty(chosen));
-        if (catalog().hasCurse(chosen)) {
-            failureReason = "Cursed enchantItem skipped";
+        if (isCursedPiece(chosen)) {
+            // Binding/vanishing curse: the piece is never ground, merged or renamed. It is judged done right here - the
+            // withdrawal still runs (the sword has to enter the bag first), then the workflow moves on to the next
+            // piece of the batch and this one leaves with the single batch unload instead of costing a trip of its own.
+            keepCursed = true;
+            skipUntil.put(identityKey(chosen), System.currentTimeMillis() + SKIP_COOLDOWN_MS);
+            setWorkflowStatus("Cursed enchantItem kept untouched; it leaves with the batch unload");
+            trace("fetched cursed piece left untouched: {}", describeItem(chosen));
+            state = State.RESTOCK_INPUT_TAKE;
+            return;
+        }
+        if (isDeliverable(target, chosen)) {
+            // Already carries the whole target set, name included: nothing to plan. It stays in the bag and leaves with
+            // the batch unload, so it neither costs a trip of its own nor blocks the pieces that still need work.
+            keepDone = true;
+            setWorkflowStatus("Fetched a finished piece; it leaves with the batch unload");
+            trace("fetched finished piece kept for the batch unload: {}", describeItem(chosen));
             state = State.RESTOCK_INPUT_TAKE;
             return;
         }
@@ -2430,6 +2566,7 @@ public class AutoEnchantModule extends Module {
             return;
         }
         Map<String, Integer> current = catalog().enchantments(item);
+        trace("reset check: {} -> {}", describeItem(item), resetReason(item));
         if (current.isEmpty()) {
             setWorkflowStatus("Fetched a blank item; enchanting from scratch");
             return;
@@ -2447,14 +2584,23 @@ public class AutoEnchantModule extends Module {
             trace("fetched item is already enchanted; {}", rename ? "a rename-only pass follows" : "nothing left to do");
             return;
         }
-        if (!withinPlan(current)) {
-            if (!AutoEnchantPlugin.PLUGIN_CONFIG.allowGrindstone) {
-                setWorkflowStatus("Fetched item has extra enchantments but grindstone processing is disabled; continuing without a reset");
+        if (needsReset(item)) {
+            if (!grindstoneUsable()) {
+                // Without a grindstone position those enchantments can never be taken off, so the piece can never
+                // equal the target: merging books into it only burns levels and books on something that is unloaded as
+                // a failure at the end. Reject it here, exactly like a carried piece that does not fit the plan - the
+                // status line alone used to let the merge order run on a bane/smite sword.
+                failureReason = "Fetched item carries enchantments outside the target and no grindstone is configured";
+                setWorkflowStatus("Fetched item does not fit the target; no grindstone configured, sending it to the output container");
+                trace("handoff: extra enchantments {} cannot be removed (no grindstone position); piece rejected",
+                    describeEnchants(current));
                 return;
             }
             grindRequired = true;
             setWorkflowStatus("Fetched an enchanted item; resetting on the grindstone once");
+            return;
         }
+        grindRequired = false;
     }
 
     /** Reads the configured target set into the short-id form the catalog and planner use. */
@@ -2642,6 +2788,7 @@ public class AutoEnchantModule extends Module {
         if (free < 1) {
             if (flushFinishedProduct("no free slot for the withdrawal")) return;
             if (flushExcessInput("no free slot for the withdrawal")) return;
+            if (flushSurplusBooks("no free slot for the withdrawal")) return;
             // No retry and no back-off: the window stays open and the same withdraw is tried again on the next tick,
             // once a finished product could be unloaded or the operator freed a slot.
             setWorkflowStatus("Bag is full: no free slot to take the withdrawal");
@@ -2656,12 +2803,13 @@ public class AutoEnchantModule extends Module {
         int alreadyCarried = countCarriedById(configuredItemId());
         int wanted = Math.min(batchSize - alreadyCarried, free);
         // How much this chest can actually give: a batch that ends up short is either an empty pickup chest or pieces
-        // the withdraw filter refused, and the two look identical in the batch line alone.
+        // the withdraw filter refused, and the two look identical in the batch line alone. Every piece of the job is
+        // takeable - blank, half enchanted, mixed or finished - so a chest is only "empty" when it holds none.
         int offered = 0;
         for (int slot = 0; slot < topSlots(); slot++) {
             ItemStack stack = openContainer().getItemStack(slot);
             if (stack == null || stack.getId() != configuredItemId()) continue;
-            if (isDeliverable(target, stack)) continue;
+            // Every piece counts, finished ones included: they are part of the batch and leave with its unload trip.
             offered++;
         }
         trace("pickup batch: {} piece(s) already carried, withdrawing {} more (batch size {}, {} free slot(s), "
@@ -2685,7 +2833,7 @@ public class AutoEnchantModule extends Module {
         restockWanted = wanted;
         List<com.zenith.feature.inventory.actions.InventoryAction> actions = new ArrayList<>(
             InventoryActionMacros.withdraw(openContainerId(),
-                stack -> stack.getId() == configuredItemId() && !isDeliverable(target, stack),
+                stack -> stack.getId() == configuredItemId(),
                 wanted));
         if (actions.isEmpty()) {
             restockItemId = -1;
@@ -2751,35 +2899,310 @@ public class AutoEnchantModule extends Module {
         state = State.GRINDSTONE_INSERT;
     }
 
+    /**
+     * A piece with a binding or vanishing curse. It is never ground (the user keeps cursed swords as they are), never
+     * merged and never renamed: it is judged done when it is taken in, stays in the bag and leaves with the batch's
+     * single unload trip, so it neither costs a trip of its own nor blocks the batch.
+     */
+    private boolean isCursedPiece(ItemStack stack) {
+        return stack != null && catalog().hasCurse(stack);
+    }
+
+    /**
+     * True when a grindstone position is configured. Grinding is unconditional (a piece carrying enchantments outside
+     * the target is always reset), so the only thing that can disable it is a missing position: without one the piece
+     * can never reach the target and is unloaded instead of being retried against a station that is not there.
+     */
+    private boolean grindstoneUsable() {
+        BlockPos configured = AutoEnchantPlugin.PLUGIN_CONFIG.grindstone;
+        return configured != null && !BlockPos.ZERO.equals(configured);
+    }
+
+    /**
+     * Batch-wide reset decision, made once the batch is in the bag and before any book is fetched.
+     *
+     * <p>Every carried piece of the job is compared with the template on its own (see {@link #needsReset}): a blank
+     * sword, one that already matches the template and one carrying only template enchantments are left alone; only
+     * the ones carrying something the template does not want are ground. The grinding itself then runs in
+     * <em>one</em> grindstone window for the whole batch - ten pieces cost one walk and one window instead of ten -
+     * and afterwards the batch returns to the per-piece enchanting loop, which plans each piece from its own (now
+     * blank) enchantments and fetches the books the whole batch needs in a single campaign.
+     */
+    private void beginBatchGrind() {
+        if (target == null && batchJob != null) target = batchJob;
+        if (target == null) { state = State.NEXT_BOOK; return; }
+        if (targetEnchants == null || targetEnchants.isEmpty()) targetEnchants = targetEnchantsOf(target);
+        // A cursed or already finished piece ends its own work right here; the batch's other pieces still get their
+        // clean-up, but this piece must not fall through into the anvil with a plan that belongs to another item.
+        boolean pieceRetired = keepCursed || keepDone;
+        List<Integer> candidates = grindCandidates();
+        if (candidates.isEmpty()) {
+            if (pieceRetired) { retireCurrentPiece(); return; }
+            trace("batch grind: no carried piece needs cleaning; continuing with the enchant steps");
+            state = State.NEXT_BOOK;
+            return;
+        }
+        if (!grindstoneUsable()) {
+            // No grindstone position: those enchantments can never come off, so each piece is rejected by its own
+            // reset check when it is adopted and leaves with the batch unload instead of being retried forever.
+            trace("batch grind: {} piece(s) need cleaning but no grindstone is configured", candidates.size());
+            if (pieceRetired) { retireCurrentPiece(); return; }
+            state = State.NEXT_BOOK;
+            return;
+        }
+        BlockPos configured = AutoEnchantPlugin.PLUGIN_CONFIG.grindstone;
+        if (grindstoneMissing(configured)) { reportMissingGrindstone(configured); return; }
+        batchGrindPass = true;
+        batchGrindTotal = candidates.size();
+        batchGrindDone = 0;
+        trace("batch grind pass: {} of this batch's piece(s) carry enchantments outside the template; "
+            + "one window for all of them", batchGrindTotal);
+        adoptGrindPiece(candidates.getFirst());
+        openingPosition = configured;
+        state = State.GRINDSTONE_GO_TO_CHEST;
+    }
+
+    /**
+     * Slots of the batch's pieces that have to be ground, in bag order, with one trace line per piece so the
+     * per-piece decision is replayable. Pieces are judged one by one - a blank sword next to a mixed one is never
+     * dragged to the grindstone by its neighbour.
+     */
+    private List<Integer> grindCandidates() {
+        return grindCandidates(true);
+    }
+
+    private List<Integer> grindCandidates(boolean verbose) {
+        List<Integer> slots = new ArrayList<>();
+        if (target == null) return slots;
+        if (targetEnchants == null || targetEnchants.isEmpty()) targetEnchants = targetEnchantsOf(target);
+        for (int slot = 9; slot <= 44; slot++) {
+            ItemStack stack = playerItem(slot);
+            if (stack == null) continue;
+            var job = runnableJobFor(stack);
+            if (job.isEmpty() || job.get() != target) continue;
+            if (isCoolingDown(stack) || isCursedPiece(stack)) continue;
+            if (isDeliverable(target, stack)) continue;
+            boolean reset = needsReset(stack);
+            // One line per piece, but only on the opening scan: re-scanning between two pieces would repeat the same
+            // nine "nothing to do" lines for every piece of the batch.
+            if (verbose) trace("batch grind check: slot {} {} -> {}", slot, describeItem(stack), resetReason(stack));
+            if (reset) slots.add(slot);
+        }
+        return slots;
+    }
+
+    /** Slot of the next carried piece of this batch that still needs cleaning, or -1 when the pass is done. */
+    private int nextGrindCandidate() {
+        List<Integer> slots = grindCandidates(false);
+        return slots.isEmpty() ? -1 : slots.getFirst();
+    }
+
+    /** Makes one carried piece the piece in hand, as the grindstone pass needs it (it is not a fresh withdrawal). */
+    private void adoptGrindPiece(int slot) {
+        ItemStack stack = playerItem(slot);
+        if (stack == null) return;
+        playerSlot = slot;
+        sourceSlot = -1;
+        itemSnapshot = stack.clone();
+        origin = Origin.INVENTORY;
+        grindRequired = true;
+        grindBlankBefore = countBlankPieces(stack.getId());
+        batchGrindDone++;
+        trace("batch grind {}/{}: {}", batchGrindDone, batchGrindTotal, describeItem(stack));
+        setWorkflowStatus("Batch grind " + batchGrindDone + "/" + batchGrindTotal + ": " + describeItem(stack));
+    }
+
+    /**
+     * Ends one ground piece. Inside a batch pass the grindstone window stays open and the next piece that needs
+     * cleaning goes straight in; once nothing is left, the transaction is dropped and the batch returns to its
+     * per-piece enchanting loop so each piece is planned from its own enchantments.
+     */
+    private void finishGrindPass() {
+        if (!batchGrindPass) { closeContainer(State.NEXT_BOOK); return; }
+        int next = nextGrindCandidate();
+        if (next >= 0) {
+            if (openContainerId() != 0) {
+                // Same window, next piece: no walk, no reopen, no settle wait.
+                adoptGrindPiece(next);
+                state = State.GRINDSTONE_INSERT;
+                return;
+            }
+            // The window went away between two pieces (a block change or a stray click): walk up and open it again.
+            trace("batch grind: the grindstone window closed between pieces; reopening it");
+            state = State.GRINDSTONE_GO_TO_CHEST;
+            return;
+        }
+        batchGrindPass = false;
+        trace("batch grind done: {} piece(s) cleaned in one window", batchGrindDone);
+        setWorkflowStatus("Batch grind done: " + batchGrindDone + " piece(s) cleaned; fetching books for the batch");
+        AutoEnchantConfig.Enchant job = batchJob;
+        clearTransaction();
+        if (job != null) { target = job; targetEnchants = targetEnchantsOf(job); }
+        if (openContainerId() != 0) closeContainer(State.NEXT_ENCHANT); else state = State.NEXT_ENCHANT;
+    }
+
+    /**
+     * Drops a transaction whose piece is finished by rule - a cursed piece or one already matching the target - so
+     * the batch keeps moving instead of carrying a plan that was never built for that item.
+     */
+    private void retireCurrentPiece() {
+        AutoEnchantConfig.Enchant job = batchJob;
+        clearTransaction();
+        if (job != null) { target = job; targetEnchants = targetEnchantsOf(job); }
+        state = State.NEXT_ENCHANT;
+    }
+
+    /** Blank copies of one item id in the bag; the grindstone result must raise this count by exactly one. */
+    private int countBlankPieces(int itemId) {
+        int count = 0;
+        for (int slot = 9; slot <= 44; slot++) {
+            ItemStack stack = playerItem(slot);
+            if (stack == null || stack.getId() != itemId) continue;
+            if (carriesAnyEnchantment(stack)) continue;
+            count++;
+        }
+        return count;
+    }
+
     private void prepareGrindstone() {
-        // Hard guard: the grindstone belongs to the equipment pickup flow only. Book pickups, anvil merges and any
-        // other step must never reset an enchantItem, and a carried enchantItem is resumed as-is.
-        if (origin != Origin.INPUT_CHEST) {
+        // Only pieces that belong to an equipment transaction are cleaned. Book pickups and anvil merges must never
+        // reset an enchantItem; a carried equipment piece is cleaned exactly like a freshly fetched one, because it came
+        // out of the same supply chest a little earlier.
+        if (origin != Origin.INPUT_CHEST && origin != Origin.INVENTORY) {
             grindRequired = false;
             setWorkflowStatus("Reset skipped: only items taken from the equipment input chest are cleaned");
             state = State.NEXT_BOOK;
             return;
         }
+        // The decision belongs to the piece in hand, so it is re-made here instead of trusting the flag: a piece that
+        // is blank or that carries nothing but template enchantments must not take the trip at all, even if the flag
+        // was set for another sword of the same batch. This is the last gate before the grindstone is opened.
+        if (targetEnchants == null && target != null) deriveTargetEnchants();
+        if (itemSnapshot == null || !needsReset(itemSnapshot)) {
+            grindRequired = false;
+            setWorkflowStatus("Reset skipped: this piece needs no cleaning; continuing with its plan");
+            trace("reset check: {} -> {}", itemSnapshot == null ? "no piece in hand" : describeItem(itemSnapshot),
+                itemSnapshot == null ? "nothing to reset" : resetReason(itemSnapshot));
+            state = State.NEXT_BOOK;
+            return;
+        }
+        trace("reset check: {} -> {}", describeItem(itemSnapshot), resetReason(itemSnapshot));
         BlockPos configured = AutoEnchantPlugin.PLUGIN_CONFIG.grindstone;
         if (configured == null || BlockPos.ZERO.equals(configured)) {
             keepAndRetry("Grindstone is required but not configured");
+            return;
+        }
+        if (grindstoneMissing(configured)) {
+            reportMissingGrindstone(configured);
             return;
         }
         openingPosition = configured;
         state = State.GRINDSTONE_GO_TO_CHEST;
     }
 
+    /**
+     * Puts the piece into the grindstone: one item in one input, the other input empty. Which of the two inputs holds
+     * it does not matter - the block disenchants either one - so the only rules are "exactly one item" and "the other
+     * input is empty". A piece the window already holds alone is therefore left where it is (that also covers a retry
+     * after a failed take, when the piece is no longer in the bag); anything else in an input is carried back to the
+     * bag first, because two filled inputs switch the block to repair mode, which keeps every enchantment.
+     */
     private void insertIntoGrindstone() {
+        Integer already = aloneInputHolding();
+        if (already != null) {
+            trace("grindstone: the piece already sits alone in input {}; keeping it there", already + 1);
+            state = State.GRINDSTONE_AWAIT_RESULT;
+            return;
+        }
         playerSlot = findPlayerItem(itemSnapshot);
         if (playerSlot < 0) { fail("Cannot find current equipment before grindstone"); return; }
-        // A quick move into an empty grindstone window lands in the first input slot, one packet instead of two.
-        List<com.zenith.feature.inventory.actions.InventoryAction> actions =
-            new ArrayList<>(moveIntoStation(playerSlot, 0, stationInputsEmpty()));
+        boolean untouched = stationInputsEmpty();
+        List<com.zenith.feature.inventory.actions.InventoryAction> actions = new ArrayList<>();
+        List<String> moved = appendClearGrindstoneInputs(actions);
+        if (moved == null) { keepAndRetry("No empty BOT inventory slot to clear the grindstone inputs"); return; }
+        if (!moved.isEmpty()) {
+            info("Auto-enchant: moved {} back to the bag; the grindstone takes one item in one input at a time",
+                String.join(", ", moved));
+        }
+        // Quick move when the window was untouched (it lands in the first input), explicit clicks otherwise: by the
+        // time the queued clearing clicks run, both inputs are empty again, but the cached window still shows the old
+        // items, so a quick move would be decided against stale contents.
+        actions.addAll(moveIntoStation(playerSlot, 0, untouched));
         submit(actions, State.GRINDSTONE_AWAIT_RESULT);
     }
 
+    /**
+     * Index of the input that holds this piece alone while the other input is empty, or null when the window is not
+     * in exactly that state. Used to keep a piece that is already correctly placed instead of shuffling it around.
+     */
+    private Integer aloneInputHolding() {
+        if (itemSnapshot == null) return null;
+        for (int slot = 0; slot <= 1; slot++) {
+            if (stationInputEmpty(slot)) continue;
+            if (!stationInputEmpty(1 - slot)) return null;
+            ItemStack inSlot = openContainer().getItemStack(slot);
+            return inSlot != null && sameStackIdentity(inSlot, itemSnapshot) ? slot : null;
+        }
+        return null;
+    }
+
+    /**
+     * Appends the clicks that carry anything sitting in a grindstone input back into the bag. Disenchanting needs
+     * exactly one item in one input with the other one empty, whichever input it is; two filled inputs mean repair
+     * mode, which keeps every enchantment and outputs the two items combined, so the piece would come back enchanted
+     * and the trip would be wasted. This module fills only one input, and anything else found in either one (an
+     * earlier repair attempt, a manual visit) is taken out before the piece goes in - the order does not matter.
+     *
+     * @return what was moved (empty when both inputs were already empty), or null when the bag has no room for it.
+     */
+    private List<String> appendClearGrindstoneInputs(List<com.zenith.feature.inventory.actions.InventoryAction> actions) {
+        int top = topSlots();
+        java.util.Set<Integer> used = new java.util.HashSet<>();
+        List<String> moved = new ArrayList<>();
+        for (int slot = 0; slot <= 1; slot++) {
+            if (stationInputEmpty(slot)) continue;
+            int empty = findEmptyPlayerSlotExcept(top, used);
+            if (empty < 0) return null;
+            used.add(empty);
+            ItemStack leftover = openContainer().getItemStack(slot);
+            moved.add("grindstone input " + (slot + 1) + " " + describeItem(leftover));
+            // The inputs belong to this workflow; anything in them that is not the piece in hand was put there by
+            // hand. It has to move for the piece to fit, so it is announced instead of silently ending up in the BOT
+            // bag, where no unload trip would ever take it.
+            if (!sameStackIdentity(leftover, itemSnapshot)) {
+                warn("Auto-enchant: a grindstone input held {} - moved it to the bag, check the BOT inventory",
+                    describeItem(leftover));
+            }
+            actions.add(new ClickItem(openContainerId(), slot, ClickItemAction.LEFT_CLICK));
+            actions.add(new ClickItem(openContainerId(), inventoryContainerSlot(empty, top), ClickItemAction.LEFT_CLICK));
+        }
+        return moved;
+    }
+
     private void verifyGrindstonePreview() {
-        if (openContainer().getItemStack(2) != Container.EMPTY_STACK) { state = State.GRINDSTONE_TAKE; return; }
+        if (!stationInputEmpty(1)) {
+            // Disenchanting is one item in the first input and an empty second one; two filled inputs switch the block
+            // to repair mode, which keeps every enchantment and outputs the two items combined. Any item in the second
+            // input therefore blocks the pass and is carried back to the bag before the piece is placed again - the
+            // output of a repair is never taken, that would hand the piece back enchanted and count the grind as done.
+            setWorkflowStatus("The grindstone holds two items (repair mode); emptying both inputs before placing the piece again");
+            List<com.zenith.feature.inventory.actions.InventoryAction> actions = new ArrayList<>();
+            List<String> moved = appendClearGrindstoneInputs(actions);
+            if (moved == null) { keepAndRetry("No empty BOT inventory slot to clear the grindstone inputs"); return; }
+            if (!moved.isEmpty()) info("Auto-enchant: repair mode, moved {} back to the bag", String.join(", ", moved));
+            if (actions.isEmpty()) { state = State.GRINDSTONE_INSERT; return; }
+            submit(actions, State.GRINDSTONE_INSERT);
+            return;
+        }
+        if (openContainer().getItemStack(2) != Container.EMPTY_STACK) {
+            // One line per grind so the input layout is on record: disenchanting must show a single item in the first
+            // input and an empty second one; anything else is repair mode and is refused above.
+            trace("grindstone inputs: first={} second={}",
+                stationInputEmpty(0) ? "empty" : describeItem(openContainer().getItemStack(0)),
+                stationInputEmpty(1) ? "empty" : describeItem(openContainer().getItemStack(1)));
+            state = State.GRINDSTONE_TAKE;
+            return;
+        }
         if (waitForActionTimer.tick(resultTimeoutTicks())) fail("Grindstone produced no output");
     }
 
@@ -2789,15 +3212,66 @@ public class AutoEnchantModule extends Module {
     }
 
     private void verifyGrindstoneResult() {
-        playerSlot = findPlayerItemById(itemSnapshot.getId());
+        if (batchGrindPass) {
+            // A batch carries several identical swords, so looking for "the blank one" by id and name would land on a
+            // twin that was cleaned a moment ago and report a take that never happened. The batch pass therefore only
+            // checks that the bag really gained one more blank copy of this item - the output leaving the block.
+            int blanks = countBlankPieces(itemSnapshot == null ? -1 : itemSnapshot.getId());
+            if (grindBlankBefore < 0 || blanks < grindBlankBefore + 1) {
+                if (waitForActionTimer.tick(resultTimeoutTicks())) fail("Grindstone output is not a blank piece");
+                return;
+            }
+            trace("grindstone result: blank piece taken (blank copies {} -> {})", grindBlankBefore, blanks);
+            grindBlankBefore = -1;
+            state = State.GRINDSTONE_CLOSE;
+            return;
+        }
+        playerSlot = findCleanedPiece();
         if (playerSlot < 0) {
-            if (waitForActionTimer.tick(resultTimeoutTicks())) fail("Grindstone output not received");
+            // Either the output is still in flight, or the block was in repair mode and the piece came back enchanted.
+            if (waitForActionTimer.tick(resultTimeoutTicks())) fail("Grindstone output is not a blank piece");
             return;
         }
         ItemStack cleaned = playerItem(playerSlot);
-        if (cleaned != null && !catalog().enchantments(cleaned).isEmpty()) { fail("Grindstone output still has enchantments"); return; }
         itemSnapshot = cleaned.clone();
+        // The result must be a blank piece: the grindstone takes every enchantment off, and one leftover enchantment
+        // means the piece is not the blank sword the plan then builds from. describeItem() prints the enchantment list
+        // (nothing after the name), so the log line itself proves the piece came back clean.
+        trace("grindstone result: {} (blank)", describeItem(cleaned));
         state = State.GRINDSTONE_CLOSE;
+    }
+
+    /**
+     * Slot of the piece the grindstone just returned.
+     *
+     * <p>A batch carries several identical swords, so looking the piece up by item id lands on a twin that still wears
+     * its enchantments about as often as on the cleaned one - that read as "the grindstone did not clean it" and cost a
+     * retry (a park, a cooldown, another window) on most grinds. The returned stack is blank, so the blank copy of this
+     * item with the piece's name is the piece that came back.
+     */
+    private int findCleanedPiece() {
+        int itemId = itemSnapshot.getId();
+        String name = catalog().customName(itemSnapshot);
+        for (int slot = 9; slot <= 44; slot++) {
+            ItemStack stack = playerItem(slot);
+            if (stack == null || stack.getId() != itemId) continue;
+            if (carriesAnyEnchantment(stack)) continue;
+            if (!catalog().customName(stack).equals(name)) continue;
+            return slot;
+        }
+        return -1;
+    }
+
+    /**
+     * True when the stack has an enchantments component at all. Deliberately not {@code catalog().enchantments()},
+     * which keeps only ids this client's registry knows: an id it cannot name would look like a blank piece, and a
+     * "cleaned" sword that still carries something must never be accepted as blank.
+     */
+    private boolean carriesAnyEnchantment(ItemStack item) {
+        if (item == null) return false;
+        var component = item.getDataComponentsOrEmpty().get(
+            org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentTypes.ENCHANTMENTS);
+        return component != null && !component.getEnchantments().isEmpty();
     }
 
     /**
@@ -2813,6 +3287,13 @@ public class AutoEnchantModule extends Module {
      */
     private void retryBranch(String what) {
         setWorkflowStatus(what);
+        // The branch is re-entered on the next tick, so the same reason repeats forever by design. Log it once per
+        // distinct text: a workflow that stands still without a single trace line is undiagnosable, and that is
+        // exactly what an idle loop on a full bag used to look like.
+        if (!what.equals(lastRetryBranch)) {
+            trace("branch re-entered: {}", what);
+            lastRetryBranch = what;
+        }
         clearTransaction();
     }
 
@@ -2947,6 +3428,89 @@ public class AutoEnchantModule extends Module {
         return true;
     }
 
+    /** One merge step of the target plan: the set the piece carries afterwards and the books that step adds. */
+    private record PlanStep(Map<String, Integer> carried, List<EnchantPresetCatalog.Enchant> books) { }
+
+    /**
+     * The merge steps of the target's plan for a blank piece, in the order a batch walks them.
+     *
+     * <p>Each step ends at the operation that applies a merged book to the equipment, so a step is "build the pair,
+     * apply it". The plan is always built from an empty piece: the batch moves in lockstep, and the books of a step
+     * must not depend on how far the piece in hand happens to be.
+     */
+    private List<PlanStep> batchPlanSteps() {
+        List<PlanStep> steps = new ArrayList<>();
+        if (target == null || targetEnchants.isEmpty() || renamePass) return steps;
+        String preset = targetPreset();
+        List<EnchantPresetCatalog.Operation> tree;
+        if (preset != null) {
+            tree = catalog().operations(preset, fullItemId(target.item));
+        } else {
+            var plan = CustomEnchantPlanner.plan(target.item, Map.of(), 0, customEnchantList());
+            if (plan == null) return steps;
+            tree = plan.operations();
+        }
+        String placeholder = targetPlaceholder();
+        Map<String, Integer> previous = Map.of();
+        for (EnchantPresetCatalog.Operation operation : tree) {
+            if (!containsTarget(operation.result(), placeholder)) continue;
+            Map<String, Integer> carried = expectedEnchants(operation.result(), placeholder);
+            if (carried.equals(previous)) continue;
+            List<EnchantPresetCatalog.Enchant> stepBooks = new ArrayList<>();
+            for (var entry : carried.entrySet().stream().sorted(Map.Entry.comparingByKey()).toList()) {
+                if (previous.getOrDefault(entry.getKey(), 0) >= entry.getValue()) continue;
+                stepBooks.add(new EnchantPresetCatalog.Enchant(entry.getKey(), entry.getValue()));
+            }
+            if (!stepBooks.isEmpty()) steps.add(new PlanStep(carried, List.copyOf(stepBooks)));
+            previous = carried;
+        }
+        return steps;
+    }
+
+    /** Number of batch pieces that still miss at least one of this step's books. */
+    private int piecesMissing(PlanStep step, List<Map<String, Integer>> pieces) {
+        int count = 0;
+        for (Map<String, Integer> current : pieces) {
+            for (EnchantPresetCatalog.Enchant book : step.books()) {
+                if (current.getOrDefault(book.id(), 0) < book.level()) { count++; break; }
+            }
+        }
+        return count;
+    }
+
+    /**
+     * True when this piece can walk the batch's step ladder, i.e. when the batch frontier's books are also its own
+     * next books.
+     *
+     * <p>A blank piece is always aligned - the reference plan is built for exactly that. A piece carrying a set that
+     * is a node of the preset tree is aligned too: its remaining work is the rest of the same tree, in the same
+     * order, so the frontier step is either behind it (it needs nothing from it) or exactly its next step. A carried
+     * set that is no tree node - mending and unbreaking on a sword that never got its looting - has to be planned
+     * from the live set, and that plan starts somewhere else entirely; buying the frontier's book for it would leave
+     * the book in the bag for several steps. Those pieces are deferred to the end of the batch instead.
+     *
+     * <p>Without a preset there is no tree to align with, so every piece that already carries something is treated
+     * as off-order and planned on its own.
+     */
+    private boolean batchAligned(ItemStack stack) {
+        return stack != null && batchAligned(normalizedEnchants(stack));
+    }
+
+    /** Same decision on an already-read enchantment set. */
+    private boolean batchAligned(Map<String, Integer> current) {
+        if (current == null) return false;
+        if (current.isEmpty()) return true;
+        String preset = targetPreset();
+        if (preset == null) return false;
+        return catalog().resumePlan(preset, current, List.of()) != null;
+    }
+
+    /** Preset matching the configured target set, or null for a custom set; same rule as {@link #preparePlan}. */
+    private String targetPreset() {
+        if (target == null || targetEnchants == null || targetEnchants.isEmpty()) return null;
+        return catalog().matchPreset(target.item, targetEnchants);
+    }
+
     /**
      * Builds the campaign from the whole batch, not just the piece currently in hand. Every carried piece of this job
      * that still needs work is compared against the target set: a sword that already carries looting, unbreaking and
@@ -2954,9 +3518,11 @@ public class AutoEnchantModule extends Module {
      * per-type total is then reduced by the books already in the bag - including merged intermediates - so a batch of
      * four blank pieces withdraws four of each book and a batch of half-done pieces withdraws far fewer.
      *
-     * <p>In step order the demand is limited to the book types of the step the piece in hand is on, and the whole
-     * campaign is capped by the free bag slots. Ten blank swords therefore withdraw ten looting books, apply them,
-     * and only then come back for the next step's pair of types.
+     * <p>In step order the demand is limited to the book types of the batch's frontier step - the first step of the
+     * plan that some piece of the batch still misses, counted on the plan of a blank piece rather than on whatever the
+     * piece in hand happens to be doing. Ten blank swords therefore withdraw ten looting books, apply them, and only
+     * then come back for the next step's pair of types; a single sword that already carries looting, sweeping and
+     * unbreaking neither inflates that campaign nor drags its own later step's books into it.
      *
      * @return true when at least one chest has something to fetch
      */
@@ -2970,8 +3536,10 @@ public class AutoEnchantModule extends Module {
         int cap = batchJob != null ? Math.max(batchSize, Math.max(batchPieces, countCarriedBatchPieces())) : batchSize;
 
         // The pieces of this batch that still need enchanting. The one in hand is among them; other carried pieces
-        // join it up to the batch size. Finished products and cooling-down pieces create no demand.
+        // join it up to the batch size. Finished products and cooling-down pieces create no demand. The aligned list
+        // holds the ones that can actually walk the batch's step ladder; see batchAligned().
         List<Map<String, Integer>> pieces = new ArrayList<>();
+        List<Map<String, Integer>> aligned = new ArrayList<>();
         for (int slot = 9; slot <= 44; slot++) {
             ItemStack stack = playerItem(slot);
             if (stack == null || stack.getId() != configuredItemId()) continue;
@@ -2981,19 +3549,59 @@ public class AutoEnchantModule extends Module {
             Map<String, Integer> current = normalizedEnchants(stack);
             if (current.equals(targetEnchants)) continue;
             pieces.add(current);
+            if (batchAligned(current)) aligned.add(current);
             if (pieces.size() >= cap) break;
         }
         if (pieces.isEmpty() && itemSnapshot != null) {
             Map<String, Integer> current = new HashMap<>();
             catalog().enchantments(itemSnapshot).forEach((id, lvl) -> current.put(EnchantPresetCatalog.shortId(id), lvl));
-            if (!current.equals(targetEnchants)) pieces.add(current);
+            if (!current.equals(targetEnchants)) {
+                pieces.add(current);
+                if (batchAligned(current)) aligned.add(current);
+            }
+        }
+        Map<String, Integer> handSet = itemSnapshot == null ? Map.of() : normalizedEnchants(itemSnapshot);
+        boolean handAligned = itemSnapshot != null && batchAligned(handSet);
+        // A piece whose carried set is no node of the tree (mending + unbreaking on a sword that never got its
+        // looting) walks its own plan, so the batch ladder cannot supply it. Counting it in the ladder campaign
+        // would buy a looting book this piece will not use for several steps - the book then sits in the bag and
+        // the campaign has to be repeated for the pieces that do need it. It is deferred instead and fetches its own
+        // step's books, one shape at a time; only pieces carrying exactly the same set share that trip, because
+        // only those are guaranteed to walk the same plan.
+        List<Map<String, Integer>> campaignPieces;
+        if (handAligned) {
+            campaignPieces = aligned;
+        } else {
+            campaignPieces = pieces.stream().filter(handSet::equals).toList();
         }
 
         // Step order only ever needs the book types of the step it is on. Fetching the whole target set would buy
         // books for a step three charges ahead and fill the bag - the "inventory is full" loops of a big row batch.
         List<EnchantPresetCatalog.Enchant> campaign = new ArrayList<>();
-        if (stepOrder() && !books.isEmpty()) {
-            for (EnchantPresetCatalog.Enchant book : books) if (!campaign.contains(book)) campaign.add(book);
+        if (stepOrder() && !handAligned) {
+            // Off-order piece: its own next step is the only thing it can consume, and its plan is not the batch's.
+            campaign.addAll(books);
+        } else if (stepOrder()) {
+            // The step belongs to the batch, not to the piece in hand. One carried sword that already has looting,
+            // sweeping and unbreaking sits several steps ahead; taking its next step's books buys sharpness and
+            // knockback for the blank pieces that cannot use them yet, which is the campaign that asked for five
+            // types at once. The frontier is the first step of the plan some piece still misses.
+            List<PlanStep> steps = batchPlanSteps();
+            int frontier = -1;
+            for (int i = 0; i < steps.size(); i++) {
+                if (piecesMissing(steps.get(i), campaignPieces) > 0) { frontier = i; break; }
+            }
+            if (frontier >= 0) {
+                campaign.addAll(steps.get(frontier).books());
+                // Once per step, not once per campaign attempt: the branch is re-entered on every missing book.
+                if (frontier != tracedFrontier) {
+                    tracedFrontier = frontier;
+                    trace("batch step {}/{}: {} of {} piece(s) still need {}", frontier + 1, steps.size(),
+                        piecesMissing(steps.get(frontier), campaignPieces), campaignPieces.size(),
+                        steps.get(frontier).books().stream().map(b -> b.id() + " " + b.level())
+                            .collect(java.util.stream.Collectors.joining(", ")));
+                }
+            }
         } else {
             targetEnchants.forEach((id, level) -> campaign.add(new EnchantPresetCatalog.Enchant(id, level)));
         }
@@ -3003,27 +3611,55 @@ public class AutoEnchantModule extends Module {
             String id = book.id();
             int level = book.level();
             int lacking = 0;
-            for (Map<String, Integer> current : pieces) {
+            for (Map<String, Integer> current : campaignPieces) {
                 if (current.getOrDefault(id, 0) < level) lacking++;
             }
             if (lacking <= 0) continue;
             int deficit = lacking - carriedBookCopies(book);
             if (deficit > 0) want.put(book, deficit);
         }
-        // Never plan more books than the bag can accept right now: the withdraw click would bounce off a full
-        // inventory and the branch would park on "inventory is full". Types that do not fit are left for the next
-        // campaign; the merge phase notices the missing book and comes back for it.
-        int budget = Math.max(1, freeInventorySlots());
+        // Never plan more books than the bag can accept while keeping the reserve: the withdraw click would bounce
+        // off a full inventory and the branch would park on "inventory is full". A type that does not fit is left for
+        // the next campaign; the merge phase notices the missing book and comes back for it after the merges that are
+        // already possible have consumed their books and freed the slots.
+        int free = freeInventorySlots();
+        int budget = Math.max(0, free - BOOK_FETCH_RESERVE);
+        int demand = want.values().stream().mapToInt(Integer::intValue).sum();
+        if (demand > budget) {
+            trace("book campaign: {} book(s) wanted, {} fit next to the pieces ({} free slot(s), {} kept in reserve); "
+                + "the rest waits for the next campaign", demand, budget, free, BOOK_FETCH_RESERVE);
+        }
         for (var entry : want.entrySet()) {
-            if (budget <= 0) break;
             if (fetchEmpty.contains(entry.getKey())) continue;
-            int take = Math.min(entry.getValue(), budget);
+            int take = entry.getValue();
+            if (take > budget) {
+                // A whole type or nothing: half a type leaves part of the batch one step ahead of the rest, and the
+                // next campaign then asks for two steps' books at once - which is exactly the 30-books-next-to-10-
+                // swords request that does not fit in a 36-slot bag.
+                trace("book campaign: {} {} x{} does not fit ({} slot(s) left); leaving the whole type for the next "
+                    + "campaign", entry.getKey().id(), entry.getKey().level(), take, budget);
+                continue;
+            }
             budget -= take;
             fetchQueue.add(new BookFetch(entry.getKey(), take));
         }
+        // No whole type fit (the bag is packed with other things): take a partial type rather than stall. The batch
+        // then advances a few pieces at a time - slower, but it always makes progress instead of parking.
+        if (fetchQueue.isEmpty() && budget > 0) {
+            for (var entry : want.entrySet()) {
+                if (fetchEmpty.contains(entry.getKey())) continue;
+                int take = Math.min(entry.getValue(), budget);
+                budget -= take;
+                fetchQueue.add(new BookFetch(entry.getKey(), take));
+                trace("book campaign: taking {} {} x{} (partial type; the bag has no room for the whole type)",
+                    entry.getKey().id(), entry.getKey().level(), take);
+                break;
+            }
+        }
         if (!fetchQueue.isEmpty()) {
-            trace("book campaign planned for {} piece(s): {} type(s), {} book(s) to withdraw",
-                pieces.size(), fetchQueue.size(), fetchQueue.stream().mapToInt(BookFetch::want).sum());
+            trace("book campaign planned for {} of {} piece(s): {} type(s), {} book(s) to withdraw",
+                campaignPieces.size(), pieces.size(), fetchQueue.size(),
+                fetchQueue.stream().mapToInt(BookFetch::want).sum());
         }
         return !fetchQueue.isEmpty();
     }
@@ -3673,6 +4309,9 @@ public class AutoEnchantModule extends Module {
             if (isCoolingDown(stack) || catalog().hasCurse(stack)) continue;
             if (normalizedEnchants(stack).equals(wanted)) continue;
             int score = progressScore(stack);
+            // Same rule as the picker: an off-order piece walks its own plan, so it must not take over the open
+            // anvil window while the batch is still walking the ladder.
+            if (!batchAligned(stack)) score += 1000;
             if (score < bestScore) { bestScore = score; best = slot; }
         }
         return best;
@@ -3773,6 +4412,12 @@ public class AutoEnchantModule extends Module {
      */
     private List<Integer> depositTargets() {
         List<Integer> slots = new ArrayList<>();
+        // Leftover books are slot-scoped: only the copies beyond what the batch still misses leave, never the ones
+        // the next merge needs.
+        if (returningExcessBook) return surplusBookSlots();
+        // A return trip carries exactly the slots it picked: an over-filled batch sends its surplus, a bag with no
+        // free slot sends the one least-worked piece.
+        if (returningExcessInput) return returnSlots;
         if (!flushing && !batchUnload && !returningExcessInput) {
             playerSlot = findCurrentEquipment();
             if (playerSlot >= 0) slots.add(playerSlot);
@@ -3784,6 +4429,9 @@ public class AutoEnchantModule extends Module {
 
     /** True when this stack is what a flush trip wants to store: the job's item, already at its target set. */
     private boolean isDepositTarget(ItemStack stack) {
+        // A leftover-book trip is decided per slot by surplusBookSlots(); identity comparison would sweep every
+        // copy of the same book, including the ones the next merge still needs.
+        if (returningExcessBook) return false;
         if (stack == null || itemSnapshot == null) return false;
         if (stack.getId() != itemSnapshot.getId()) return false;
         // A batch unload deposits every finished product of this job, not just this piece. A regular single-piece
@@ -3795,10 +4443,14 @@ public class AutoEnchantModule extends Module {
         // A return trip takes every RAW piece of the job; a flush/batch unload takes every piece that is DONE - the
         // target enchantments AND the template name. Depositing on the enchantments alone filed nine unnamed swords
         // into the output chest next to the one piece the rename pass had just named.
-        if (returningExcessInput) return catalog().enchantments(stack).isEmpty();
+        // A return trip takes the pieces its own slot list names (see depositTargets).
+        if (returningExcessInput) return !isDeliverable(target, stack);
         // A rename the anvil refused (cost past the limit) is given up on for this piece: it leaves unnamed rather
         // than holding the whole batch in the bag forever.
         if (renameGivenUp && itemSnapshot != null && sameStackIdentity(itemSnapshot, stack)) return true;
+        // Binding/vanishing curse: such a piece is judged done when it arrives, is never worked on, and leaves with
+        // this same unload trip - otherwise it would sit in the bag forever, since it can never equal the target.
+        if (isCursedPiece(stack)) return true;
         return isDeliverable(target, stack);
     }
 
@@ -3811,7 +4463,7 @@ public class AutoEnchantModule extends Module {
             // batch never passes through that loop - it is the one that hands the workflow to this unload. Left to
             // the single completion log the batch reported "1 piece(s)" while the chest received ten. The deposit is
             // the honest count, so whatever the completion log did not count is added here.
-            if (!flushing && !returningExcessInput && batchJob != null) {
+            if (!flushing && !returningExcessInput && !returningExcessBook && batchJob != null) {
                 int uncounted = depositSlots.size() - stats.batchPieces;
                 if (uncounted > 0) recordPiecesDone(uncounted);
             }
@@ -3837,6 +4489,18 @@ public class AutoEnchantModule extends Module {
     /** Target slots that still hold a depositable stack; slots are stable while the window stays open. */
     private List<Integer> remainingDepositSlots() {
         List<Integer> left = new ArrayList<>();
+        if (returningExcessBook) {
+            List<Integer> surplus = surplusBookSlots();
+            for (int slot : depositSlots) if (surplus.contains(slot)) left.add(slot);
+            return left;
+        }
+        if (returningExcessInput) {
+            for (int slot : returnSlots) {
+                ItemStack stack = playerItem(slot);
+                if (stack != null && stack.getId() == configuredItemId()) left.add(slot);
+            }
+            return left;
+        }
         for (int slot : depositSlots) if (isDepositTarget(playerItem(slot))) left.add(slot);
         return left;
     }
@@ -3866,6 +4530,22 @@ public class AutoEnchantModule extends Module {
             return;
         }
         if (openContainerId() != 0) { closeContainer(State.POST_ENCHANT); return; }
+        // Leftover books go back to the book chest the enchantment is bound to; there is no other container that
+        // would take them without mixing them into the finished-product chest.
+        if (returningExcessBook) {
+            Optional<BlockPos> bookChest = bookChestFor(itemSnapshot);
+            if (bookChest.isPresent()) {
+                openingPosition = bookChest.get();
+                trace("returning {} leftover book stack(s) to the book chest at {} (first: {})",
+                    surplusBookSlots().size(), openingPosition, describeItem(itemSnapshot));
+                setWorkflowStatus("Carrying leftover books back to the book chest at " + openingPosition);
+                state = State.POST_ENCHANT_INPUT_GO_TO;
+                return;
+            }
+            trace("no book chest is bound for the leftover book {}; unloading it to the output chest instead",
+                describeItem(itemSnapshot));
+            returningExcessBook = false;
+        }
         // A successful item goes to the unload chest. A failed (half-done) item goes to the same chest, or back to the
         // input chest when the job's post-enchant mode asks for it. "overflow" is only a role name now: it resolves to
         // the job's output chest, because finished and half-done pieces share one container.
@@ -4126,6 +4806,41 @@ public class AutoEnchantModule extends Module {
         state = State.AWAIT_RESTOCK;
     }
 
+    /**
+     * True when the chunk holding the configured grindstone is loaded but no grindstone stands there: the block was
+     * broken, moved, or the marker points at air. The storage-container check cannot answer this, because a grindstone
+     * is a workstation and not a container.
+     */
+    private boolean grindstoneMissing(BlockPos pos) {
+        return pos != null && World.isChunkLoadedBlockPos(pos.x(), pos.z())
+            && World.getBlock(pos.x(), pos.y(), pos.z()).id() != BlockRegistry.GRINDSTONE.id();
+    }
+
+    /**
+     * Parks the grindstone branch for a doubling backoff when the block is not there. The piece stays in the bag - it
+     * is exactly the item the grindstone was needed for - and the warning names both ways out: put a grindstone back
+     * at the configured position; without it, pieces carrying extra enchantments are unloaded instead of cleaned.
+     */
+    private void reportMissingGrindstone(BlockPos pos) {
+        long now = System.currentTimeMillis();
+        Long until = missingContainerUntil.get(pos);
+        if (until != null && now < until) {
+            awaitRestockUntil(until);
+            state = State.AWAIT_RESTOCK;
+            return;
+        }
+        int misses = missingContainerMisses.merge(pos, 1, Integer::sum);
+        long backoff = Math.min(MISSING_CONTAINER_MAX_MS,
+            MISSING_CONTAINER_MIN_MS * (1L << Math.min(4, misses - 1)));
+        missingContainerUntil.put(pos, now + backoff);
+        String what = "The grindstone at " + pos + " is gone (" + blockNameAt(pos) + " is there now); checking again in "
+            + (backoff / 1000) + "s";
+        warn("Auto-enchant: {} - put a grindstone back there, pieces needing a reset cannot be cleaned", what);
+        setWorkflowStatus(what);
+        awaitRestockUntil(now + backoff);
+        if (openContainerId() != 0) closeContainer(State.AWAIT_RESTOCK); else state = State.AWAIT_RESTOCK;
+    }
+
     /** Forget a missing-container flag once a window actually opened at that position. */
     private void clearMissingContainer(BlockPos pos) {
         if (pos == null) return;
@@ -4180,17 +4895,20 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
-     * Budget for one open click before it is re-sent: four ticks (one client use-cooldown), then the full interaction
-     * budget for a block that keeps refusing.
+     * Budget for one open click before it is re-sent: the configured value for the first three attempts, then the full
+     * interaction budget for a block that keeps refusing.
      *
-     * <p>Measured: at this server nearly every open misses once and the re-sent click opens the window in the same
-     * second, whether the budget was 5, 10 or 20 ticks. So the first click is not slow, it is dropped - the BOT has
-     * just walked up and its position has not reached the server yet. Waiting the full budget only adds dead time on
-     * every chest and anvil (36 opens a batch); four ticks covers the position round trip, and a block that really
-     * cannot be opened still falls back to the long budget so it is not hammered.
+     * <p>Measured over 500+ windows: an accepted click opens the window in under 100ms, so the budget never decides
+     * whether a window is seen — the remaining misses arrive in bursts where the click is dropped by the server and the
+     * re-sent click opens the window just as fast. A longer budget therefore only adds dead time, see
+     * {@link AutoEnchantConfig#openRetryTicks}.
      */
     private long openRetryTicks() {
-        return openClickMisses <= 2 ? 4L : interactTimeoutTicks();
+        // The operator's budget, in ticks, for re-sending an open click that produced no window. It stays a setting
+        // because the link is not the only thing that can change: a server that answers slowly (rather than dropping
+        // the click) would want a longer wait, and this is the knob to try without a restart.
+        long ticks = Math.max(1L, AutoEnchantPlugin.PLUGIN_CONFIG.openRetryTicks);
+        return openClickMisses <= 2 ? ticks : interactTimeoutTicks();
     }
 
     /** Counts an open click that produced no window, starting over when the block being opened is a different one. */
@@ -4205,15 +4923,43 @@ public class AutoEnchantModule extends Module {
         openClickMisses++;
         if (openClickMisses == 1) {
             // Distance is printed because a click that is out of reach is dropped silently by the server, and these
-            // misses are frequent enough that the cause has to be visible in the log rather than guessed.
+            // misses are frequent enough that the cause has to be visible in the log rather than guessed. The budget is
+            // printed next to it because that value lives only in the running process: the file on disk keeps whatever
+            // it was started with, and the two diverge after a command changes the setting.
             var player = CACHE.getPlayerCache().getThePlayer();
             double dist = player == null ? -1
                 : Math.sqrt(Math.pow(player.getX() - (openingPosition.x() + 0.5), 2)
                     + Math.pow(player.getY() - openingPosition.y(), 2)
                     + Math.pow(player.getZ() - (openingPosition.z() + 0.5), 2));
-            trace("no window after clicking {} within {} tick(s); re-sending the click (distance {})", openingPosition,
-                openRetryTicks(), String.format("%.2f", dist));
+            trace("no window after clicking {}; re-sending in {} tick(s) (distance {})", openingPosition,
+                AutoEnchantPlugin.PLUGIN_CONFIG.openRetryTicks, String.format("%.2f", dist));
         }
+        openMissesSinceReport++;
+    }
+
+    /**
+     * Records how long the successful click took to produce a window. Every twenty windows the buckets are printed, so
+     * the retry budget can be set from measurements instead of a guess. Every window counted here was answered inside
+     * 150ms across several hundred samples, which is why the budget sits at four ticks; the misses printed in the same
+     * line are clicks the server never answered at all, and the run-to-run swing of that number is what shows they
+     * come in bursts rather than from a budget that is too short.
+     */
+    private void recordOpenLatency() {
+        if (openClickAtMs <= 0) return;
+        int ms = (int) Math.max(0L, System.currentTimeMillis() - openClickAtMs);
+        openClickAtMs = 0;
+        openLatencyCount++;
+        openLatencyMaxMs = Math.max(openLatencyMaxMs, ms);
+        openLatencyBuckets[ms < 100 ? 0 : ms < 150 ? 1 : ms < 200 ? 2 : ms < 300 ? 3 : 4]++;
+        if (openLatencyCount < 20) return;
+        trace("open latency over {} window(s): <100ms={}, 100-150={}, 150-200={}, 200-300={}, >=300={}, max={}ms, "
+                + "misses in the same span={}", openLatencyCount, openLatencyBuckets[0], openLatencyBuckets[1],
+            openLatencyBuckets[2], openLatencyBuckets[3], openLatencyBuckets[4], openLatencyMaxMs,
+            openMissesSinceReport);
+        java.util.Arrays.fill(openLatencyBuckets, 0);
+        openLatencyCount = 0;
+        openLatencyMaxMs = 0;
+        openMissesSinceReport = 0;
     }
 
     /** Round-trip budget in ticks, rounded up from {@link #awaitResultMs()} so a wait never fires early. */
@@ -4516,20 +5262,38 @@ public class AutoEnchantModule extends Module {
         if (target == null || returningExcessInput || flushing) return false;
         if (containerPosition(target, "input").isEmpty()) return false;
         List<Integer> raw = new ArrayList<>();
+        List<Integer> unfinished = new ArrayList<>();
         for (int slot = 9; slot <= 44; slot++) {
             ItemStack stack = playerItem(slot);
             if (stack == null || stack.getId() != configuredItemId()) continue;
             var job = runnableJobFor(stack);
             if (job.isEmpty() || job.get() != target) continue;
             if (catalog().hasCurse(stack)) continue;
+            if (isDeliverable(target, stack)) continue;
             if (catalog().enchantments(stack).isEmpty()) raw.add(slot);
+            else unfinished.add(slot);
         }
-        // Keep one batch of raw pieces; only the surplus is safe to send back. With a healthy bag nothing is surplus
-        // and this path is a no-op - the over-filled bag is the only thing that reaches it.
-        if (raw.size() <= Math.max(1, PLUGIN_CONFIG.batchSize)) return false;
-        int slot = raw.getFirst();
-        ItemStack stack = playerItem(slot);
-        playerSlot = slot;
+        List<Integer> slots = new ArrayList<>();
+        int keep = Math.max(1, PLUGIN_CONFIG.batchSize);
+        int free = freeInventorySlots();
+        if (raw.size() > keep) {
+            // More raw pieces than one batch: everything past the batch size goes back, as before.
+            for (int i = keep; i < raw.size(); i++) slots.add(raw.get(i));
+        } else if (free < FREE_SLOTS_FOR_TRANSACTION && (!raw.isEmpty() || !unfinished.isEmpty())) {
+            // Not enough room for the next step (one book plus the merge that consumes it): half-done pieces go back
+            // too. Their enchantments stay on the item and the input chest hands them out again next round, so
+            // nothing is lost. The least-worked pieces go first, and enough of them leave in one trip to make the
+            // next book fetch possible - sending one piece per trip would only repeat the same walk five times.
+            int need = Math.max(1, FREE_SLOTS_FOR_TRANSACTION - free);
+            List<Integer> pool = new ArrayList<>(raw);
+            unfinished.sort(java.util.Comparator.comparingInt(slot -> catalog().enchantments(playerItem(slot)).size()));
+            pool.addAll(unfinished);
+            for (int i = 0; i < Math.min(need, pool.size()); i++) slots.add(pool.get(i));
+        }
+        if (slots.isEmpty()) return false;
+        returnSlots = List.copyOf(slots);
+        ItemStack stack = playerItem(slots.getFirst());
+        playerSlot = slots.getFirst();
         sourceSlot = -1;
         itemSnapshot = stack.clone();
         operations = List.of();
@@ -4548,12 +5312,134 @@ public class AutoEnchantModule extends Module {
         depositRetries = 0;
         waitForRestockTimer.reset();
         beginTransaction();
-        trace("bag low on space ({}); returning {} surplus raw {} to the input chest to free slots",
-            reason, raw.size(), describeItem(stack));
-        setWorkflowStatus("Bag is over-filled with raw input; returning " + raw.size()
-            + " surplus " + describeItem(stack) + " to the input chest");
+        trace("bag low on space ({}); returning {} piece(s) to the input chest to free a slot: {}{}",
+            reason, slots.size(), describeItem(stack), slots.size() > 1 ? " and more" : "");
+        setWorkflowStatus("Bag is full; returning " + slots.size() + " piece(s) "
+            + describeItem(stack) + " to the input chest to free a slot");
         state = State.POST_ENCHANT;
         return true;
+    }
+
+    /**
+     * Frees a bag jammed by leftover enchantment books by carrying the ones this batch no longer needs back to their
+     * book chest.
+     *
+     * <p>A step withdraws one copy per piece. When a piece of the batch fails, is unloaded early or already carried
+     * the enchantment, its copy stays behind; ten swords plus a step's copies plus leftovers is exactly the "BOT
+     * inventory is full; no room for X" loop that stops the whole workflow with nothing to unload - the swords were
+     * already delivered. Books are the only stack a batch can accumulate like this, and they came out of a marked
+     * chest, so the safe exit is to put them back.
+     *
+     * @return true when a return trip was started and the caller must stop its own step
+     */
+    private boolean flushSurplusBooks(String reason) {
+        if (returningExcessBook) return false;
+        // Called from the idle entry point as well, where no job is selected yet: the batch (or the first runnable
+        // job) names the target whose books may be surplus.
+        if (target == null) {
+            if (batchJob != null) target = batchJob;
+            else {
+                List<AutoEnchantConfig.Enchant> runnable = runnableJobs();
+                if (!runnable.isEmpty()) target = runnable.getFirst();
+            }
+        }
+        if (target == null) return false;
+        List<Integer> surplus = surplusBookSlots();
+        if (surplus.isEmpty()) return false;
+        ItemStack stack = playerItem(surplus.getFirst());
+        if (stack == null) return false;
+        playerSlot = surplus.getFirst();
+        sourceSlot = -1;
+        itemSnapshot = stack.clone();
+        origin = Origin.INVENTORY;
+        operations = List.of();
+        books = List.of();
+        operationIndex = 0;
+        bookIndex = 0;
+        failureReason = null;
+        grindRequired = false;
+        renamePass = false;
+        backToBooks = false;
+        outputStored = false;
+        flushing = false;
+        batchUnload = false;
+        returningExcessInput = false;
+        returningExcessBook = true;
+        depositSlots = List.of();
+        depositRetries = 0;
+        waitForRestockTimer.reset();
+        beginTransaction();
+        trace("bag low on space ({}); carrying {} leftover book(s) back to their book chest: {}{}",
+            reason, surplus.size(), describeItem(stack), surplus.size() > 1 ? " and more" : "");
+        setWorkflowStatus("Bag is full of leftover books; carrying " + surplus.size() + " stack(s) back to the book chest");
+        state = State.POST_ENCHANT;
+        return true;
+    }
+
+    /**
+     * Slots of carried enchantment books no piece of this batch still needs.
+     *
+     * <p>Per book type: what the batch is missing ({@code lacking}) against what the bag already holds. Only the
+     * copies beyond the missing count are surplus, and only single-enchantment books are considered - a merged
+     * intermediate may cover two branches and is left alone. Books of enchantments the target does not name at all
+     * (another job's property) are not touched either.
+     */
+    private List<Integer> surplusBookSlots() {
+        List<Integer> slots = new ArrayList<>();
+        if (target == null) return slots;
+        if (targetEnchants == null || targetEnchants.isEmpty()) targetEnchants = targetEnchantsOf(target);
+        Map<String, Integer> lacking = new HashMap<>();
+        for (int slot = 9; slot <= 44; slot++) {
+            ItemStack stack = playerItem(slot);
+            if (stack == null || stack.getId() != configuredItemId()) continue;
+            var job = runnableJobFor(stack);
+            if (job.isEmpty() || job.get() != target) continue;
+            if (isCoolingDown(stack) || catalog().hasCurse(stack)) continue;
+            Map<String, Integer> current = normalizedEnchants(stack);
+            if (current.equals(targetEnchants)) continue;
+            targetEnchants.forEach((id, lvl) -> {
+                if (current.getOrDefault(id, 0) < lvl) lacking.merge(id, 1, Integer::sum);
+            });
+        }
+        List<Integer> bookSlots = new ArrayList<>();
+        List<String> bookIds = new ArrayList<>();
+        Map<String, Integer> carried = new HashMap<>();
+        for (int slot = 9; slot <= 44; slot++) {
+            ItemStack stack = playerItem(slot);
+            if (stack == null || stack.getId() != ItemRegistry.ENCHANTED_BOOK.id()) continue;
+            Map<String, Integer> stored = readEnchants(stack, true);
+            if (stored.size() != 1) continue;
+            var entry = stored.entrySet().iterator().next();
+            String id = EnchantPresetCatalog.shortId(entry.getKey());
+            Integer wanted = targetEnchants.get(id);
+            // Not part of this target, or below the level the target wants: it can never satisfy a piece here.
+            if (wanted == null || entry.getValue() < wanted) continue;
+            bookSlots.add(slot);
+            bookIds.add(id);
+            carried.merge(id, 1, Integer::sum);
+        }
+        Map<String, Integer> surplus = new HashMap<>();
+        carried.forEach((id, count) -> {
+            int extra = count - Math.min(count, lacking.getOrDefault(id, 0));
+            if (extra > 0) surplus.put(id, extra);
+        });
+        for (int i = 0; i < bookSlots.size(); i++) {
+            String id = bookIds.get(i);
+            Integer extra = surplus.get(id);
+            if (extra == null || extra <= 0) continue;
+            surplus.put(id, extra - 1);
+            slots.add(bookSlots.get(i));
+        }
+        return slots;
+    }
+
+    /** Book chest bound for this stack's single enchantment, used to carry a leftover book back. */
+    private Optional<BlockPos> bookChestFor(ItemStack stack) {
+        if (stack == null || stack.getId() != ItemRegistry.ENCHANTED_BOOK.id()) return Optional.empty();
+        Map<String, Integer> stored = readEnchants(stack, true);
+        if (stored.size() != 1) return Optional.empty();
+        var entry = stored.entrySet().iterator().next();
+        return bookContainerPosition(EnchantPresetCatalog.shortId(entry.getKey()), entry.getValue());
     }
 
     private BlockPos firstAnvil() {
@@ -4668,7 +5554,21 @@ public class AutoEnchantModule extends Module {
     private void openBatch(AutoEnchantConfig.Enchant job) {
         if (job == null || batchJob == job) return;
         batchJob = job;
+        tracedFrontier = -1;
         batchPieces = countCarriedBatchPieces();
+        if (batchPieces == 0) {
+            // Every carried piece of this job is cooling down after repeated failures. A batch recorded as empty would
+            // push the piece in hand straight to the unload chest and split the run into one-piece trips - each with
+            // its own unload visit - while the bag is still full of the job's pieces. Lifting the cooldown is the same
+            // rule the restock already uses when the bag is full of one job; the pieces are then worked on again and
+            // leave together at the closing unload.
+            int cleared = clearCooldownForCarriedJob(job);
+            if (cleared > 0) {
+                batchPieces = countCarriedBatchPieces();
+                trace("batch: lifted the retry cooldown of {} carried piece(s) of {} so the batch stays whole",
+                    cleared, job.displayName());
+            }
+        }
         // The first piece of a session is measured from here, not from its own completion, and the batch clock starts
         // with the record: one piece per batch is what the per-batch stat reports.
         noteStatsWorkStarted();
@@ -4731,6 +5631,7 @@ public class AutoEnchantModule extends Module {
         recordBatchDone();
         batchJob = null;
         batchPieces = 0;
+        tracedFrontier = -1;
     }
 
     /**
@@ -4776,7 +5677,7 @@ public class AutoEnchantModule extends Module {
             // Only deliverable pieces (target set + template name) leave the bag: one that still needs its rename
             // stays behind and is handled by the rename pass instead of being unloaded unnamed. A rename the anvil
             // refused past the level limit is the one exception - it goes out unnamed rather than blocking the batch.
-            if (!isDeliverable(batchJob, stack)
+            if (!isDeliverable(batchJob, stack) && !isCursedPiece(stack)
                 && !(renameGivenUp && itemSnapshot != null && sameStackIdentity(itemSnapshot, stack))) continue;
             finished.add(slot);
         }
@@ -4913,7 +5814,7 @@ public class AutoEnchantModule extends Module {
         // Attempt counters survive a failed round so a repeatedly failing enchantItem eventually gets parked. A round
         // only counts as a success once the item really left the inventory: a parked retry is not a success, otherwise
         // the counter would be zeroed on every loop and the item would retry forever.
-        boolean maintenance = flushing || returningExcessInput;
+        boolean maintenance = flushing || returningExcessInput || returningExcessBook;
         boolean succeeded = outputStored && failureReason == null && !maintenance;
         // Log only real endings: a stored enchantItem or a failed one. A transient step failure keeps the
         // enchantItem in the inventory and is retried silently instead of spamming Discord. A flush or an excess-input
@@ -4921,6 +5822,7 @@ public class AutoEnchantModule extends Module {
         if (retryReason != null) trace("transaction parked for a retry: {} (retries={})", retryReason, transientRetries);
         if (flushing) trace("flush finished: bag space freed, back to the enchant queue");
         if (returningExcessInput) trace("excess raw input returned: bag space freed, back to the enchant queue");
+        if (returningExcessBook) trace("leftover books returned: bag space freed, back to the enchant queue");
         trace("transaction timings: reset {}s, anvil {}s, carried inputs {} -> {}, finished outputs {}",
             secondsSince(unchantStartTime), secondsSince(enchantStartTime),
             preEnchantInputCount, target == null ? 0 : countCarriedById(configuredItemId()), preEnchantOutputCount);
@@ -5146,6 +6048,8 @@ public class AutoEnchantModule extends Module {
      * log compares against, and the two start times split the reset (grindstone) phase from the anvil phase.
      */
     private void beginTransaction() {
+        // A real transaction started, so the next idle loop is a new situation and must be logged again.
+        lastRetryBranch = null;
         transactionStartedAt = System.currentTimeMillis();
         preEnchantInputCount = countCarriedById(configuredItemId());
         preEnchantOutputCount = countFinishedProducts(target);
@@ -5203,7 +6107,8 @@ public class AutoEnchantModule extends Module {
         state = State.ENTRYPOINT; target = null; itemSnapshot = null; operations = List.of(); books = List.of();
         operationIndex = bookIndex = 0; activeContainerId = 0; sourceSlot = playerSlot = -1;
         fetchQueue.clear(); fetchIndex = 0; fetchBefore = 0; fetchEmpty.clear();
-        failureReason = null; grindRequired = false;
+        failureReason = null; grindRequired = false; keepCursed = false; keepDone = false;
+        batchGrindPass = false; batchGrindTotal = 0; batchGrindDone = 0; grindBlankBefore = -1;
         clearAllPathFutures(); clearActionFuture();
         anvilBlockCraftFuture = RequestFuture.rejected;
         waitForInteractTimer.reset(); waitForActionTimer.reset(); waitForRestockTimer.reset();
@@ -5232,6 +6137,8 @@ public class AutoEnchantModule extends Module {
         outputStored = false;
         flushing = false;
         returningExcessInput = false;
+        returningExcessBook = false;
+        returnSlots = List.of();
         batchUnload = false;
         depositSlots = List.of();
         depositRetries = 0;
@@ -5272,6 +6179,19 @@ public class AutoEnchantModule extends Module {
     private int inventoryContainerSlot(int playerInventorySlot, int top) { return top + playerInventorySlot - 9; }
     private int findEmptyPlayerSlot(int top) {
         for (int slot = 9; slot <= 44; slot++) if (openContainer().getItemStack(inventoryContainerSlot(slot, top)) == Container.EMPTY_STACK) return slot;
+        return -1;
+    }
+
+    /**
+     * Empty player slot, ignoring the ones already chosen as a target by clicks still sitting in the queue: their
+     * destination is still empty in the cached window, so picking the same slot twice would send the second stack onto
+     * the first one's cursor.
+     */
+    private int findEmptyPlayerSlotExcept(int top, java.util.Set<Integer> used) {
+        for (int slot = 9; slot <= 44; slot++) {
+            if (used.contains(slot)) continue;
+            if (openContainer().getItemStack(inventoryContainerSlot(slot, top)) == Container.EMPTY_STACK) return slot;
+        }
         return -1;
     }
     private int findPlayerItem(ItemStack reference) {

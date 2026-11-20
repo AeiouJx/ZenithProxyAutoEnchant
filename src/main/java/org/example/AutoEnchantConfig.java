@@ -26,7 +26,6 @@ public class AutoEnchantConfig {
     public BlockPos anvil = BlockPos.ZERO;
     public BlockPos anvilChest = BlockPos.ZERO;
 
-    public boolean allowGrindstone = false;
     public int anvilRestockStacks = 1;
     /**
      * How many pieces of one equipment are enchanted per batch. A restock tops the bag up to this number, counting
@@ -66,6 +65,22 @@ public class AutoEnchantConfig {
 
     public int actionDelay = 5;
     public long restartDelay = 5L;
+    /**
+     * Ticks to wait after a right click on a chest, anvil or grindstone before the click is sent again.
+     *
+     * <p>This is not {@link #restartDelay}: that one is the backoff after a failed step. This one only covers the round
+     * trip of the open click itself. Measured on the live bot over 500+ windows: when the server accepts a click the
+     * window answers in under 100ms, and no window in that sample took more than 150ms. Four ticks is therefore already
+     * twice the round trip.
+     *
+     * <p>The misses that remain do not come from a short budget: they arrive in bursts of five to ten minutes in which
+     * the first click of nearly every open is dropped outright and the re-sent click opens the window inside the same
+     * hundred milliseconds. A longer budget cannot rescue a dropped click, it only adds that wait to every open in the
+     * burst (about 45 opens a batch, so eight ticks cost roughly nine seconds a batch); it was raised to eight on a
+     * single clean phase and the next burst showed the same miss rate as before, so four is the default. After three
+     * attempts at the same block the full {@link #waitForInteractTimeoutTicks} budget takes over.
+     */
+    public long openRetryTicks = 4L;
     /**
      * KILL experience source only. Length of one kill window: the BOT stands at {@code ExpFarmSpot}, KillAura is
      * switched on for this long, a few silverfish die, and the aura is switched off again so the enchant work can
