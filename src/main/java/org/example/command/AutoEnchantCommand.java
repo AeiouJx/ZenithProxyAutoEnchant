@@ -108,15 +108,13 @@ public class AutoEnchantCommand extends Command {
                 .then(literal("help").executes(c-> {
                     List<String> setCommands = List.of(
                         "set <id> on/off",
-                        "set <id> inputItem <item>",
-                        "set <id> outputItem <item>",
+                        "set <id> <enchantItem>",
                         "set <id> inputItemChest <x> <y> <z>",
                         "set <id> outputChest <x> <y> <z>",
-                        "set <id> outputItemStoreCountThreshold <count>",
-                        "set <id> enchants add <enchantment> <level>",
-                        "set <id> enchants del <enchantment>",
-                        "set <id> enchants clear",
-                        "set <id> enchants list",
+                        "set <id> renameName set <name> | clear",
+                        "set <id> outputEnchants add <enchantment> <level>",
+                        "set <id> outputEnchants del <enchantment>",
+                        "set <id> outputEnchants clear | list",
                         "set <id> postEnchantStore <none/to_restock/to_overflow>"
                     );
                     c.getSource().getEmbed()

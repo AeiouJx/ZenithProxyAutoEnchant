@@ -39,3 +39,6 @@ build
 
 # WorkBuddy workspace data (memory, skills, temp)
 /.workbuddy/
+
+# Local deploy target (host alias and plugin directory stay off the repository)
+deploy.local.sh
