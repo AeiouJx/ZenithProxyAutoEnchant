@@ -230,10 +230,9 @@ public class AutoEnchantModule extends Module {
         missingContainerMisses.clear();
         anvilSupplyEmptyRounds = 0;
         bookStockoutUntil.clear();
+        bookStockoutLooks.clear();
         jobStockoutUntil.clear();
         jobStockoutRounds.clear();
-        bookStockoutSince = 0L;
-        bookStockoutKey = null;
         stockoutEvacuation = false;
         state =  State.ENTRYPOINT;
         waitForInteractTimer.reset();
@@ -1987,6 +1986,8 @@ public class AutoEnchantModule extends Module {
     private AutoEnchantConfig.Enchant batchJob;
     /** Recorded size of the open batch (raw + half-done + finished); drives the whole-batch book campaign. */
     private int batchPieces;
+    /** The open batch was unloaded unfinished because a book it needs is out of stock; only affects the close log. */
+    private boolean batchAbandoned;
     /** Whether the current piece came from a batch still waiting in the bag (then the job must not rotate yet). */
     private boolean itemFromRestockBatch;
     /**
@@ -2022,11 +2023,25 @@ public class AutoEnchantModule extends Module {
      *
      * <p>A required book with no copy in its chest used to park the workflow on that chest forever: the batch keeps
      * its job latched, so a bag of swords waiting for one missing book blocks every other item type sitting in the
-     * shared pickup chest. When {@link AutoEnchantConfig#bookStockoutSeconds} runs out the piece in hand is unloaded as
-     * half-done; the rest of its batch then leaves at once instead of waiting the same timeout per piece, and a new
-     * batch does not stall on the same book again within this window.
+     * shared pickup chest. One second after the first empty chest the batch is unloaded and the job is set aside; the
+     * mark keeps a new batch from walking to the same empty chest again while the job is waiting.
      */
     private final Map<String, Long> bookStockoutUntil = new HashMap<>();
+    /**
+     * How many times the chest of a required book may be opened and found without it before the batch is given up on.
+     * Five looks is enough for a restock that is happening by hand (the chest is reopened about once a second) and
+     * short enough that the platform never stands in front of an empty chest: the whole batch leaves, the job is set
+     * aside, and the next item type in the pickup chest runs.
+     */
+    private static final int STOCKOUT_EMPTY_LOOKS = 5;
+    /** Empty looks per book type in this stockout, keyed by {@code id|level}; cleared when the book arrives. */
+    private final Map<String, Integer> bookStockoutLooks = new HashMap<>();
+    /**
+     * Slots that a stockout evacuation carries to the deposit chest in one trip: every piece of the abandoned batch,
+     * finished or not. Unloading them one at a time cost a walk to the chest per piece; leaving the untouched ones in
+     * the bag only filled it with a job that cannot run.
+     */
+    private List<Integer> evacuationSlots = List.of();
     /**
      * Jobs that just had a batch evacuated, and how many times in a row. A blocked job is not fetched from the pickup
      * chest until its mark expires, which is what actually lets another item type run; the wait doubles on every
@@ -2035,13 +2050,13 @@ public class AutoEnchantModule extends Module {
      */
     private final Map<String, Long> jobStockoutUntil = new HashMap<>();
     private final Map<String, Integer> jobStockoutRounds = new HashMap<>();
-    /** Wall clock of the first "this chest holds no X" for the current piece, and which book that was about. */
-    private long bookStockoutSince;
-    private String bookStockoutKey;
+    /** First set-aside after a stockout: five minutes, doubling to an hour so a dead job costs one batch per hour. */
+    private static final long JOB_SET_ASIDE_MS = 300_000L;
+    private static final long JOB_SET_ASIDE_MAX_MS = 3_600_000L;
     /**
-     * Set while the piece is unloaded because its book ran out. The unload goes to the deposit chest whatever the job's
-     * {@code postEnchantStoreMode} says: sending the piece back to the pickup chest would hand it straight back to the
-     * same empty book chest on the next cycle, which is the loop this evacuation exists to break.
+     * Set while the batch is unloaded because a book it needs ran out. The unload goes to the deposit chest whatever the
+     * job's {@code postEnchantStoreMode} says: sending the pieces back to the pickup chest would hand them straight back
+     * to the same empty book chest on the next cycle, which is the loop this evacuation exists to break.
      */
     private boolean stockoutEvacuation;
     private static final int MAX_ITEM_ATTEMPTS = 3;
@@ -3492,31 +3507,25 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
-     * True when this book has been missing long enough to give up on the piece in hand.
+     * True when this book has been missing for enough looks to give up on the batch.
      *
-     * <p>The timer starts the first time the book is found unavailable for the current piece and is not reset while the
-     * workflow keeps coming back to the same one, so a batch that simply has to wait out a hand restock is untouched.
-     * Meeting the timeout unloads the piece as half-done and remembers the book as out of stock, which is what lets the
-     * rest of its batch and any following batch move on without paying the same wait again.
+     * <p>Every call is one visit to the book: the chest was opened and holds no copy, or there is no chest to open at
+     * all. Five of those in a row mean the book is not being restocked right now, and waiting longer only holds every
+     * other job on the platform, because the batch latch keeps their pieces in the bag.
      */
     private boolean bookOutOfStock(EnchantPresetCatalog.Enchant book, String what) {
-        long now = System.currentTimeMillis();
         String key = book.id() + "|" + book.level();
         if (bookMarkedOutOfStock(book)) {
-            evacuateForStockout(book, 0L, true);
+            evacuateForStockout(book, 0, true);
             return true;
         }
-        if (!key.equals(bookStockoutKey)) {
-            bookStockoutKey = key;
-            bookStockoutSince = now;
-        }
-        long waited = now - bookStockoutSince;
-        if (waited < stockoutTimeoutMs()) {
-            setWorkflowStatus(what + " (" + (waited / 1000) + "s of " + (stockoutTimeoutMs() / 1000) + "s)");
+        int looks = bookStockoutLooks.merge(key, 1, Integer::sum);
+        if (looks < STOCKOUT_EMPTY_LOOKS) {
+            setWorkflowStatus(what + " (" + looks + "/" + STOCKOUT_EMPTY_LOOKS
+                + " looks; the batch moves on after " + STOCKOUT_EMPTY_LOOKS + ")");
             return false;
         }
-        bookStockoutUntil.put(key, now + stockoutTimeoutMs());
-        evacuateForStockout(book, waited, false);
+        evacuateForStockout(book, looks, false);
         return true;
     }
 
@@ -3524,10 +3533,6 @@ public class AutoEnchantModule extends Module {
     private boolean bookMarkedOutOfStock(EnchantPresetCatalog.Enchant book) {
         Long until = bookStockoutUntil.get(book.id() + "|" + book.level());
         return until != null && System.currentTimeMillis() < until;
-    }
-
-    private long stockoutTimeoutMs() {
-        return Math.max(30L, AutoEnchantPlugin.PLUGIN_CONFIG.bookStockoutSeconds) * 1000L;
     }
 
     /** {@code 5 min} / {@code 90s} for log lines, so a doubled wait still reads at a glance. */
@@ -3559,43 +3564,69 @@ public class AutoEnchantModule extends Module {
         // ten-piece batch would jump straight to the hourly cap on its way out.
         if (until != null && now < until) return until - now;
         int rounds = jobStockoutRounds.merge(job.item, 1, Integer::sum);
-        long backoff = Math.min(3_600_000L, stockoutTimeoutMs() * (1L << Math.min(4, rounds - 1)));
+        long backoff = Math.min(JOB_SET_ASIDE_MAX_MS, JOB_SET_ASIDE_MS * (1L << Math.min(4, rounds - 1)));
         jobStockoutUntil.put(job.item, now + backoff);
         return backoff;
     }
 
     /** A book arrived for this job: the stockout marks and the escalating wait are history. */
     private void clearStockoutMarks(AutoEnchantConfig.Enchant job, EnchantPresetCatalog.Enchant book) {
-        if (book != null) bookStockoutUntil.remove(book.id() + "|" + book.level());
-        bookStockoutKey = null;
-        bookStockoutSince = 0L;
+        if (book != null) {
+            String key = book.id() + "|" + book.level();
+            bookStockoutUntil.remove(key);
+            bookStockoutLooks.remove(key);
+        }
         if (job == null || job.item == null) return;
         jobStockoutUntil.remove(job.item);
         jobStockoutRounds.remove(job.item);
     }
 
     /**
-     * Unloads the piece in hand as half-done so the platform can move on to the next job.
+     * Unloads the batch so the platform can move on to the next job.
      *
-     * <p>The piece is not failed: it keeps every merge it already paid for and leaves through the deposit chest like
-     * any other half-done piece, so feeding it back in later resumes it. The job itself is left alone - it stays
-     * enabled and simply has nothing to do until the book is stocked.
+     * <p>Nothing is failed: the piece in hand keeps every merge it already paid for, the rest of the batch is exactly
+     * as it came out of the pickup chest, and all of them leave through the deposit chest in one trip instead of one
+     * walk per piece. The job itself stays enabled and simply has nothing to do until the book is stocked; it is set
+     * aside for a while so the platform does not pull the same pieces again on the next cycle.
      */
-    private void evacuateForStockout(EnchantPresetCatalog.Enchant book, long waitedMs, boolean alreadyMarked) {
+    private void evacuateForStockout(EnchantPresetCatalog.Enchant book, int looks, boolean alreadyMarked) {
+        AutoEnchantConfig.Enchant job = batchJob != null ? batchJob : target;
+        String key = book.id() + "|" + book.level();
         stockoutEvacuation = true;
-        bookStockoutKey = null;
-        bookStockoutSince = 0L;
-        String waited = alreadyMarked || waitedMs < 1000L ? "still out of stock" : "out of stock for " + (waitedMs / 1000) + "s";
-        String job = target == null ? "the job" : target.displayName();
-        long blocked = blockJobForStockout(target);
-        trace("book {} {} {}; unloading the piece as half-done so the platform can take another job",
-            book.id(), book.level(), waited);
-        warn("Auto-enchant: book {} {} {} - the half-done {} goes to the deposit chest and the platform moves on to "
-            + "the next job (that job waits {} before taking another piece)", book.id(), book.level(), waited, job,
+        batchAbandoned = batchJob != null;
+        // The count is spent: a later attempt after the set-aside gets the same five looks again, so a book that is
+        // only being restocked a minute late is not thrown out on its first empty chest.
+        bookStockoutLooks.remove(key);
+        long blocked = blockJobForStockout(job);
+        // The mark lasts exactly as long as the set-aside: while it stands no window is spent on that book and no batch
+        // of that job is picked up, so both expire together and the platform simply comes back to it later.
+        bookStockoutUntil.put(key, System.currentTimeMillis() + blocked);
+        evacuationSlots = batchEvacuationSlots(job);
+        int pieces = Math.max(1, evacuationSlots.size());
+        String waited = alreadyMarked ? "is still out of stock"
+            : "was empty " + looks + " times in a row";
+        String jobName = job == null ? "the job" : job.displayName();
+        trace("book {} {} {}; unloading {} piece(s) of {} to the deposit chest so the platform can take another job",
+            book.id(), book.level(), waited, pieces, jobName);
+        warn("Auto-enchant: book {} {} {} - the {} piece(s) of {} go to the deposit chest and the platform moves on to "
+            + "the next job (that job is set aside for {})", book.id(), book.level(), waited, pieces, jobName,
             waitText(blocked));
-        failureReason = "book " + book.id() + " " + book.level() + " " + waited;
-        setWorkflowStatus("Book " + book.id() + " " + book.level() + " out of stock; unloading the half-done piece");
+        failureReason = "book " + book.id() + " " + book.level() + " out of stock";
+        setWorkflowStatus("Book " + book.id() + " " + book.level() + " out of stock; unloading the batch");
         if (openContainerId() != 0) closeContainer(State.POST_ENCHANT); else state = State.POST_ENCHANT;
+    }
+
+    /** Every carried piece of {@code job}: what a stockout evacuation takes out of the bag in one trip. */
+    private List<Integer> batchEvacuationSlots(AutoEnchantConfig.Enchant job) {
+        List<Integer> slots = new ArrayList<>();
+        if (job == null) return slots;
+        for (int slot = 9; slot <= 44; slot++) {
+            ItemStack stack = playerItem(slot);
+            if (stack == null) continue;
+            if (runnableJobFor(stack).orElse(null) != job) continue;
+            slots.add(slot);
+        }
+        return slots;
     }
 
     /**
@@ -4629,6 +4660,8 @@ public class AutoEnchantModule extends Module {
         // A return trip carries exactly the slots it picked: an over-filled batch sends its surplus, a bag with no
         // free slot sends the one least-worked piece.
         if (returningExcessInput) return returnSlots;
+        // A stockout evacuation empties the whole abandoned batch in one window, whether the pieces are finished or not.
+        if (!evacuationSlots.isEmpty()) return evacuationSlots;
         if (!flushing && !batchUnload && !returningExcessInput) {
             playerSlot = findCurrentEquipment();
             if (playerSlot >= 0) slots.add(playerSlot);
@@ -4673,10 +4706,17 @@ public class AutoEnchantModule extends Module {
             // A step-wise batch completes most of its pieces inside the batch loop, but the piece that closes the
             // batch never passes through that loop - it is the one that hands the workflow to this unload. Left to
             // the single completion log the batch reported "1 piece(s)" while the chest received ten. The deposit is
-            // the honest count, so whatever the completion log did not count is added here.
-            if (!flushing && !returningExcessInput && !returningExcessBook && batchJob != null) {
+            // the honest count, so whatever the completion log did not count is added here. An evacuation is the one
+            // exception: those pieces were abandoned, not finished, and counting them would report throughput for
+            // work that did not happen.
+            if (!flushing && !returningExcessInput && !returningExcessBook && evacuationSlots.isEmpty()
+                && batchJob != null) {
                 int uncounted = depositSlots.size() - stats.batchPieces;
                 if (uncounted > 0) recordPiecesDone(uncounted);
+            }
+            if (!evacuationSlots.isEmpty()) {
+                trace("stockout evacuation: {} piece(s) of the batch left the bag in one trip", depositSlots.size());
+                evacuationSlots = List.of();
             }
             state = State.CLOSE_OUTPUT;
             return;
@@ -4709,6 +4749,16 @@ public class AutoEnchantModule extends Module {
             for (int slot : returnSlots) {
                 ItemStack stack = playerItem(slot);
                 if (stack != null && stack.getId() == configuredItemId()) left.add(slot);
+            }
+            return left;
+        }
+        // An evacuation trip is slot-scoped like a return trip, but by item type: the pieces are the job's, finished
+        // or not, and a slot that still holds one of them is a click that did not land.
+        if (!evacuationSlots.isEmpty()) {
+            int itemId = itemSnapshot == null ? -1 : itemSnapshot.getId();
+            for (int slot : evacuationSlots) {
+                ItemStack stack = playerItem(slot);
+                if (stack != null && stack.getId() == itemId) left.add(slot);
             }
             return left;
         }
@@ -5787,6 +5837,7 @@ public class AutoEnchantModule extends Module {
     private void openBatch(AutoEnchantConfig.Enchant job) {
         if (job == null || batchJob == job) return;
         batchJob = job;
+        batchAbandoned = false;
         tracedFrontier = -1;
         batchPieces = countCarriedBatchPieces();
         if (batchPieces == 0) {
@@ -5860,7 +5911,14 @@ public class AutoEnchantModule extends Module {
     /** Releases the batch latch once every piece of it has left the inventory. */
     private void closeBatch() {
         if (batchJob == null) return;
-        trace("batch released: {} piece(s) of {} finished and unloaded", batchPieces, batchJob.displayName());
+        if (batchAbandoned) {
+            // A batch that left because a book was missing did no work: it must not read as ten finished pieces.
+            trace("batch released: {} piece(s) of {} went back to the deposit chest after the stockout, none finished",
+                batchPieces, batchJob.displayName());
+            batchAbandoned = false;
+        } else {
+            trace("batch released: {} piece(s) of {} finished and unloaded", batchPieces, batchJob.displayName());
+        }
         recordBatchDone();
         batchJob = null;
         batchPieces = 0;
@@ -6376,6 +6434,7 @@ public class AutoEnchantModule extends Module {
         returningExcessBook = false;
         stockoutEvacuation = false;
         returnSlots = List.of();
+        evacuationSlots = List.of();
         batchUnload = false;
         depositSlots = List.of();
         depositRetries = 0;

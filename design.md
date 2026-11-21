@@ -187,18 +187,18 @@ ZenithProxy 插件 `auto-enchant` 的完整设计与实现说明。本文是项�
 
 一件做完先留在背包（仍占本批名额），直接从背包接手下一件。整批没有待附魔件时一次性 shift-click 把该作业的成品批量卸进 `outputChest`，随后释放批次闩锁、作业指针前进。背包快满时提前卸货兜底；背包被超额空剑堵死且没有成品可卸时，把超出的一批空剑退回取货箱（原料回原料箱，不丢东西）。失败件走 `postEnchantStoreMode`，不走批量路径。
 
-### 8.3.1 缺书时的半成品卸货
+### 8.3.1 缺书时的整批卸货
 
 一个必需的书箱里没有那本书时，流程会站在书箱前反复开窗等待——而批次闩锁还握在手里，于是**整个平台都停在一种书缺失上**：取货箱里刚放进去的镐子没人取，背包里的剑也出不去。
 
-所以缺书有一个上限，`bookStockoutSeconds`（默认 300s，`autoEnchant bookStockout <seconds>` 可调）：
+所以缺书按**开箱次数**算，不是按时间：`STOCKOUT_EMPTY_LOOKS = 5`（不是可调项）。
 
-1. 从这件第一次发现书取不到开始计时（书箱空、或书箱方块被活塞门/搬走挡掉都算），期间正常等，不改行为。
-2. 超时后把这件当**半成品**卸到成品卸货箱（`outputChest`），附魔进度原样保留，喂回去就能接着做。它不算失败，不进冷却。
-3. 这本书在 `bookStockoutSeconds` 内记为缺货：同批剩下的件不再各等一轮，直接跟着卸出去；这段时间也不会再为它开书箱。
-4. 该**作业被让开**（`jobStockoutUntil`），取货箱不再取它这一类的件——这才是"去附魔下一个条目"真正生效的地方。等待时间每次翻倍（5→10→20→40 分钟，上限 1 小时），避免书长期不回时把取货箱里的同款件一批批倒进卸货箱。下次这本书真的取到时立即解除并重置翻倍。
+1. 每次打开该书箱、里面没有这本书（或书箱方块被活塞门/搬走挡掉、根本没有绑定书箱），记一次"空看"。相邻两次空看之间是完整的一轮开窗，约 1 秒一轮。
+2. 连续 5 次空看仍然没有 → **整批一起卸**：背包里属于该作业的每一件（手上的半成品 + 还没开始的白板件）在同一次开窗里 shift-click 进成品卸货箱（`outputChest`），只走一趟。半成品的附魔进度原样保留，喂回去就能接着做；它不算失败、不进冷却、不计入吞吐（`recordBatchDone` 因 0 件完成而跳过）。
+3. 这本书记为缺货，标记时长与作业让开同步：这段时间不再为它开书箱；计数清零，等让开结束后重新给满 5 次机会。
+4. 该**作业被让开**（`jobStockoutUntil`），取货箱不再取它这一类的件——这才是"去附魔下一个条目"真正生效的地方。让开时长每次翻倍（5→10→20→40 分钟，上限 1 小时），避免书长期不回时把取货箱里的同款件一批批倒进卸货箱。下次这本书真的取到时立即解除并重置翻倍。
 
-作业本身不关、不删，书补上后自动回到队列。日志是一条 WARN：`book X Y is out of stock for Ns - the half-done <item> goes to the deposit chest ...`。
+作业本身不关、不删，书补上后自动回到队列。日志是一条 WARN：`book X Y was empty 5 times in a row - the N piece(s) of <job> go to the deposit chest and the platform moves on to the next job`。批次释放时另有一条 `batch released: N piece(s) ... after the stockout, none finished`，避免读成 N 件成品。
 
 ### 8.4 状态机
 
@@ -263,7 +263,7 @@ ENTRYPOINT → EVAL_RESTOCK → RESTOCK_INPUT_* → EVAL_UNCHANT/BATCH_GRIND
 ## 13. 失败处理
 
 - 单件失败（缺书、缺铁砧、诅咒、超费用、预览不符、结果不匹配）→ 记录原因，按 `postEnchantStoreMode` 卸货或留包重试，队列继续，不设全局暂停。
-- 缺书超过 `bookStockoutSeconds` → 不再算失败，按半成品卸到成品箱并把该作业让开一段时间（见 §8.3.1），平台继续做下一个条目。
+- 缺书连续 5 次开箱没货 → 不再算失败，整批卸到成品箱并把该作业让开一段时间（见 §8.3.1），平台继续做下一个条目。
 - 环境问题（区块未加载、断线、没有可用铁砧）→ 有上限的指数退避，周期性重扫；恢复后自动续跑。
 - 站点容器消失（展示框贴附或下方的箱子/潜影盒被搬走）→ 按 2s→4s→…→30s 停放并报出名字，箱子放回即续跑；空箱子（在但没货）走同一套退避。
 - 槽位被玩家/漏斗改动 → 快照不匹配就取消当前事务，不碰陌生物品。
@@ -296,7 +296,6 @@ autoEnchant anvilRestock <stacks>                     补铁砧时取几组
 autoEnchant ExpFarmSpot <x> <y> <z>                   刷经验站位
 autoEnchant scanRange <horizontal> <vertical>         扫描半径
 autoEnchant actionDelay / restartDelay / openRetry / waitForInteractTimeout <ticks>
-autoEnchant bookStockout <seconds>                     缺书多久后卸半成品并换下一个作业
 autoEnchant renameOnly on|off                         只改名模式
 autoEnchant logTradeStatusToDiscord on|off
 ```

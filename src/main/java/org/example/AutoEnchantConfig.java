@@ -82,19 +82,6 @@ public class AutoEnchantConfig {
      */
     public long openRetryTicks = 4L;
     /**
-     * How long a required enchantment book may be missing before the piece in hand is unloaded as half-done and the
-     * platform moves on to the next job. 300 seconds = 5 minutes.
-     *
-     * <p>Without this a book chest that is simply out of one type holds the whole platform: the batch keeps its job
-     * latched, so a bag full of swords waiting for a book that is not there blocks the pickaxes sitting in the shared
-     * pickup chest. Measured on the live bot: the workflow stood at the empty book chest re-opening it, with nothing in
-     * the log but the same "holds no X" line. The piece is not failed - it goes to the deposit chest with its progress
-     * intact, exactly like any other half-done piece, and is resumed when it is fed back in. Once one piece has been
-     * evacuated the rest of its batch follows immediately instead of waiting the same five minutes each, and the book
-     * stays marked as out of stock for the same window so a new batch does not stall on it again.
-     */
-    public long bookStockoutSeconds = 300L;
-    /**
      * KILL experience source only. Length of one kill window: the BOT stands at {@code ExpFarmSpot}, KillAura is
      * switched on for this long, a few silverfish die, and the aura is switched off again so the enchant work can
      * continue. 40 ticks = 2 seconds.
