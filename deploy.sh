@@ -20,7 +20,10 @@ CONF="${ZP_DEPLOY_CONF:-$HERE/deploy.local.sh}"
 
 HOST="${ZP_HOST:-}"
 DIR="${ZP_PLUGINS_DIR:-plugins}"
-NAME="ZenithProxyAutoEnchant-1.0.0.jar"
+# The jar name carries the plugin version, so it is read from the build instead of being written twice: a version bump
+# used to leave this script looking for the previous jar and failing with "build the plugin first".
+VERSION="$(sed -n 's/^plugin_version=//p' "$HERE/gradle.properties" | tr -d '\r')"
+NAME="ZenithProxyAutoEnchant-${VERSION}.jar"
 JAR="build/libs/$NAME"
 
 if [ -z "$HOST" ]; then

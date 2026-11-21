@@ -134,7 +134,7 @@ public class AutoEnchantConfig {
             NONE,
             /** Failed (half-done) pieces go back to the shared pickup chest. */
             TO_RESTOCK,
-            /** Failed (half-done) pieces go to the unload chest, i.e. the job's output chest / equipment frame. */
+            /** Failed (half-done) pieces go to the shared deposit chest (the job's output chest). */
             TO_OVERFLOW
         }
         public Object2IntLinkedOpenHashMap<String> itemEnchantments = new Object2IntLinkedOpenHashMap<>();

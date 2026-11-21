@@ -621,12 +621,13 @@ public class AutoEnchantCommand extends Command {
                 if (!module.markerProblems().isEmpty()) embed.addField("Marker issues", String.join("\n", module.markerProblems()), false);
                 embed.addField("Note", "A frame showing equipment is the template for that enchantItem: its enchantments "
                     + "become the target set (a wiki leaf tree match = PRESET, otherwise CUSTOM) and its custom name "
-                    + "becomes the rename target. The first container below it is the unload chest, used for finished "
-                    + "and half-done pieces alike, and the first "
-                    + "redstone lamp in the column above it (up to 8 blocks, it need not touch the frame) switches the "
-                    + "job on (lit) or off (unlit). The pickup chest is the first container "
-                    + "below the redstone-dust frame. Only chests, barrels and shulker boxes count as containers; a "
-                    + "redstone-block frame is ignored.", false);
+                    + "becomes the rename target. The frame itself is the switch - there is no lamp: a template on "
+                    + "the platform enables its job, a template that was taken down disables it (never deletes it). "
+                    + "Every marker binds the block the frame is mounted on when that block is a container, otherwise "
+                    + "the first container below it: redstone dust = shared blank pickup chest, redstone block = shared "
+                    + "deposit chest (finished, half-done and failed pieces), an anvil item = anvil supply chest, an "
+                    + "enchanted book = that enchantment's book chest. Chests, trapped chests, barrels and shulker boxes "
+                    + "count as containers.", false);
                 return OK;
             }));
     }
