@@ -46,6 +46,7 @@ public class AutoEnchantCommand extends Command {
                 "actionDelay <ticks>",
                 "restartDelay <ticks>",
                 "openRetry <ticks>",
+                "bookStockout <seconds>",
                 "experienceSource <none/kill/exp>",
                 "logTradeStatusToDiscord on/off",
                 "renameOnly on/off",
@@ -411,6 +412,16 @@ public class AutoEnchantCommand extends Command {
                     .addField("Delay", PLUGIN_CONFIG.openRetryTicks + " ticks before an open click is re-sent")
                     .addField("Note", "After 3 attempts at one block the interaction timeout takes over");
             })))
+            .then(literal("bookStockout").then(argument("seconds", time()).executes(c -> {
+                // How long one missing book type may block a job before the piece in hand is unloaded as half-done
+                // and the platform moves on. 0 would evacuate on the first empty chest, which is too eager for a
+                // chest that is simply being restocked by hand.
+                PLUGIN_CONFIG.bookStockoutSeconds = Math.max(30, getInteger(c, "seconds"));
+                c.getSource().getEmbed()
+                    .title("Book Stockout Set")
+                    .addField("Timeout", PLUGIN_CONFIG.bookStockoutSeconds + "s before a half-done piece is unloaded")
+                    .addField("Note", "The piece goes to the deposit chest with its progress; the job waits for the book");
+            })))
             .then(literal("experienceSource")
                 .then(argument("source", enumStrings(AutoEnchantConfig.ExperienceSource.values())).executes(c -> {
                     var source = AutoEnchantConfig.ExperienceSource.valueOf(getString(c, "source").toUpperCase());
@@ -621,12 +632,13 @@ public class AutoEnchantCommand extends Command {
                 if (!module.markerProblems().isEmpty()) embed.addField("Marker issues", String.join("\n", module.markerProblems()), false);
                 embed.addField("Note", "A frame showing equipment is the template for that enchantItem: its enchantments "
                     + "become the target set (a wiki leaf tree match = PRESET, otherwise CUSTOM) and its custom name "
-                    + "becomes the rename target. The first container below it is the unload chest, used for finished "
-                    + "and half-done pieces alike, and the first "
-                    + "redstone lamp in the column above it (up to 8 blocks, it need not touch the frame) switches the "
-                    + "job on (lit) or off (unlit). The pickup chest is the first container "
-                    + "below the redstone-dust frame. Only chests, barrels and shulker boxes count as containers; a "
-                    + "redstone-block frame is ignored.", false);
+                    + "becomes the rename target. The frame itself is the switch - there is no lamp: a template on "
+                    + "the platform enables its job, a template that was taken down disables it (never deletes it). "
+                    + "Every marker binds the block the frame is mounted on when that block is a container, otherwise "
+                    + "the first container below it: redstone dust = shared blank pickup chest, redstone block = shared "
+                    + "deposit chest (finished, half-done and failed pieces), an anvil item = anvil supply chest, an "
+                    + "enchanted book = that enchantment's book chest. Chests, trapped chests, barrels and shulker boxes "
+                    + "count as containers.", false);
                 return OK;
             }));
     }
@@ -640,6 +652,7 @@ public class AutoEnchantCommand extends Command {
                 .addField("Action Delay", PLUGIN_CONFIG.actionDelay + " ticks")
                 .addField("Restart Delay", PLUGIN_CONFIG.restartDelay + " ticks")
                 .addField("Open Retry", PLUGIN_CONFIG.openRetryTicks + " ticks per open click")
+                .addField("Book Stockout", PLUGIN_CONFIG.bookStockoutSeconds + "s before a half-done unload")
                 .addField("Experience Source", PLUGIN_CONFIG.experienceSource.name().toLowerCase())
                 .addField("Rename Only", PLUGIN_CONFIG.renameOnly)
                 .addField("ExpFarmSpot", PLUGIN_CONFIG.ExpFarmSpot)

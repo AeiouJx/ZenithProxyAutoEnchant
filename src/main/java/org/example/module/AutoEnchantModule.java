@@ -95,12 +95,13 @@ public class AutoEnchantModule extends Module {
 
     /**
      * An equipment frame that declares one job: the displayed equipment is the template for that item type (its
-     * enchantments are the target set, its custom name is the rename target), the first container below it is that
-     * job's output chest, and the first redstone lamp in the column above the frame (not necessarily adjacent) is its
-     * on/off switch. Blank pieces to enchant come
-     * from the shared pickup chest marked by a redstone-dust frame.
+     * enchantments are the target set, its custom name is the rename target). Blank pieces to enchant come from the
+     * shared pickup chest marked by a redstone-dust frame and finished pieces leave through the shared deposit chest
+     * marked by a redstone-block frame; the frame's own container is only a fallback for a platform without that
+     * marker. The frame itself is the switch: scanning no longer reads a redstone lamp, so a job is enabled while its
+     * template frame is on the platform and disabled (not deleted) when the frame is taken down.
      */
-    public record JobFrame(String item, BlockPos framePos, BlockPos containerPos, Boolean lampOn,
+    public record JobFrame(String item, BlockPos framePos, BlockPos containerPos,
                            Map<String, Integer> enchantments, String customName) {
         /** Signature of the displayed template; a changed signature re-imports the target set on the next scan. */
         public String spec() {
@@ -118,8 +119,6 @@ public class AutoEnchantModule extends Module {
     }
 
     private static final int SUPPLY_SCAN_DEPTH = 8;
-    /** How far above a frame the column is searched for its redstone lamp; the lamp need not touch the frame. */
-    private static final int LAMP_SCAN_HEIGHT = 8;
     private static final float MIN_HEALTH = 12;
     /** Hard ceiling for one XP goal: a farm that runs this long has a problem, whatever the level check says. */
     private static final int KILLAURA_MAX_SECONDS = 900;
@@ -229,6 +228,13 @@ public class AutoEnchantModule extends Module {
         BARITONE.stop();
         missingContainerUntil.clear();
         missingContainerMisses.clear();
+        anvilSupplyEmptyRounds = 0;
+        bookStockoutUntil.clear();
+        jobStockoutUntil.clear();
+        jobStockoutRounds.clear();
+        bookStockoutSince = 0L;
+        bookStockoutKey = null;
+        stockoutEvacuation = false;
         state =  State.ENTRYPOINT;
         waitForInteractTimer.reset();
         waitForRestockTimer.reset();
@@ -334,32 +340,33 @@ public class AutoEnchantModule extends Module {
             if (shown == null) continue;
             String role = markerRole(shown);
             if (role == null) {
-                // A redstone-block frame used to mark the semi-finished chest. That chest no longer exists (finished and
-                // half-done pieces both leave through the equipment frame's container), so a leftover marker is
-                // skipped silently instead of showing up as an unrecognised frame.
-                if (shown.getId() == com.zenith.mc.item.ItemRegistry.REDSTONE_BLOCK.id()) continue;
                 // Not a book/anvil/redstone marker: a damageable enchantItem here declares a job for that item type.
                 JobFrame jobFrame = jobFrame(entity, shown);
-                if (jobFrame == null) {
-                    unrecognizedMarkers++;
-                } else {
-                    foundJobFrames.add(jobFrame);
-                    if (jobFrame.containerPos() == null) {
-                        addProblem(problems, "job frame " + jobFrame.framePos() + " (" + jobFrame.item()
-                            + "): no output container at " + candidateText(jobFrame.framePos()));
-                    }
-                }
+                if (jobFrame == null) unrecognizedMarkers++;
+                else foundJobFrames.add(jobFrame);
                 continue;
             }
             BlockPos frame = entity.blockPos();
-            BlockPos container = resolveContainer(frame);
+            BlockPos container = resolveContainer(frame, entity);
             if (container == null) {
-                addProblem(problems, role + " frame " + frame + ": no container at " + candidateText(frame));
+                addProblem(problems, role + " frame " + frame + " (" + attachedText(frame, entity) + "): no container "
+                    + "attached to the frame or below it, " + candidateText(frame));
                 continue;
             }
             foundMarkers.add(new Marker(role, frame, container, shown));
         }
-        int newJobs = applyJobFrames(foundJobFrames, problems);
+        // The deposit chest is shared now: a redstone-block frame binds every job's output chest, so a job frame no
+        // longer needs a container of its own. Only complain when neither exists - otherwise a frame on a wall would
+        // be reported as broken on a perfectly valid platform.
+        BlockPos deposit = firstMarker(foundMarkers, "output");
+        if (deposit == null) {
+            for (JobFrame jobFrame : foundJobFrames) {
+                if (jobFrame.containerPos() != null) continue;
+                addProblem(problems, "job frame " + jobFrame.framePos() + " (" + jobFrame.item()
+                    + "): no container attached or below it, and no redstone-block frame marks the deposit chest");
+            }
+        }
+        int newJobs = applyJobFrames(foundJobFrames, problems, deposit, frameCount > 0);
         boolean bindingsChanged = applyMarkerBindings(foundMarkers);
 
         Map<String, List<BlockPos>> bindingsByRole = new LinkedHashMap<>();
@@ -422,8 +429,8 @@ public class AutoEnchantModule extends Module {
             if (signatureChanged) warn("Auto-enchant marker issues ({}): {}", problems.size(), String.join("; ", problems));
         } else if ("no-usable-frames".equals(problemKey) && signatureChanged) {
             warn("Auto-enchant found {} item frame(s) but nothing usable ({} unrecognized display items). "
-                + "An equipment frame declares a job and its output chest; book, anvil and redstone-dust frames need a "
-                + "container below them. Run 'autoEnchant scan' for the per-frame problem list.", frameCount, unrecognizedMarkers);
+                + "An equipment frame declares a job; book, anvil and redstone frames must be mounted on a container "
+                + "(or sit above one). Run 'autoEnchant scan' for the per-frame problem list.", frameCount, unrecognizedMarkers);
         }
     }
 
@@ -432,41 +439,31 @@ public class AutoEnchantModule extends Module {
      * decorative frame must never create an entry nobody asked for, and the command's add/set choices use the same list.
      *
      * <p>The displayed stack is a template, not the item that will be processed: its enchantments become the target
-     * set and its custom name becomes the rename target. The output chest is the first container below the frame.
+     * set and its custom name becomes the rename target. Its container (the block it is mounted on, else the first
+     * container below it) is only a fallback for the deposit chest - normally the redstone-block frame declares that
+     * chest for the whole platform.
      */
     private JobFrame jobFrame(Entity entity, ItemStack shown) {
         var itemData = ItemRegistry.REGISTRY.get(shown.getId());
         if (itemData == null) return null;
         if (!EquipmentType.isEquipment(itemData.name())) return null;
         BlockPos frame = entity.blockPos();
-        return new JobFrame(EnchantPresetCatalog.shortId(itemData.name()), frame, supplyContainerPos(frame),
-            lampState(frame), catalog.enchantments(shown), catalog.customName(shown));
+        return new JobFrame(EnchantPresetCatalog.shortId(itemData.name()), frame, resolveContainer(frame, entity),
+            catalog.enchantments(shown), catalog.customName(shown));
     }
 
     /**
-     * Lit lamp switches the job on, unlit off. The lamp does not have to sit directly on top of the frame: the first
-     * redstone lamp anywhere in the same column above it (up to {@link #LAMP_SCAN_HEIGHT} blocks) is used, so a frame
-     * mounted on a wall or a pillar with the lamp on the pillar's top still works. Null when the column holds no lamp,
-     * in which case the stored on/off value wins.
+     * Creates missing job entries for the scanned frames and keeps existing ones in sync.
+     *
+     * <p>A frame is the on/off switch now: a job whose template frame is present is enabled, a job whose template
+     * frame is gone is disabled but never deleted, so its targets, name and chests survive a platform rebuild. The
+     * presence rule only runs when the scan actually saw a frame - a scan from elsewhere must not disable the whole
+     * platform. The output chest is the shared deposit chest when a redstone-block frame declares one; otherwise the
+     * frame's own container is used, which keeps an older per-job platform working. A template whose enchantments or
+     * name changed is re-imported. Two frames for the same enchantItem are reported instead of silently fighting over
+     * the output chest.
      */
-    private Boolean lampState(BlockPos frame) {
-        if (!World.isChunkLoadedBlockPos(frame.x(), frame.z())) return null;
-        BlockPos cursor = frame.add(0, 1, 0);
-        for (int dy = 1; dy <= LAMP_SCAN_HEIGHT; dy++, cursor = cursor.add(0, 1, 0)) {
-            if (!World.isInWorldBounds(cursor.x(), cursor.y(), cursor.z())) return null;
-            if (World.getBlock(cursor.x(), cursor.y(), cursor.z()).id() != BlockRegistry.REDSTONE_LAMP.id()) continue;
-            return World.getBlockState(cursor).getProperty(com.zenith.mc.block.properties.api.BlockStateProperties.LIT);
-        }
-        return null;
-    }
-
-    /**
-     * Creates missing job entries for the scanned frames and keeps existing ones in sync: the finished chest always
-     * follows the frame's own container, a lamp (when present) always wins over the stored on/off value, and a
-     * template whose enchantments or name changed is re-imported. Two frames for the same enchantItem are reported instead
-     * of silently fighting over the finished chest.
-     */
-    private int applyJobFrames(List<JobFrame> frames, List<String> problems) {
+    private int applyJobFrames(List<JobFrame> frames, List<String> problems, BlockPos deposit, boolean platformVisible) {
         AutoEnchantConfig config = AutoEnchantPlugin.PLUGIN_CONFIG;
         List<JobFrame> previousFrames = List.copyOf(jobFrames);
         Map<String, BlockPos> boundChests = new LinkedHashMap<>();
@@ -496,14 +493,16 @@ public class AutoEnchantModule extends Module {
                 job = new AutoEnchantConfig.Enchant();
                 job.item = frame.item();
                 config.enchants.put(key, job);
-                if (frame.containerPos() != null) job.outputChest = frame.containerPos();
+                BlockPos output = deposit != null ? deposit : frame.containerPos();
+                if (output != null) job.outputChest = output;
                 if (frame.declaresTarget()) importFrameSpec(job, frame);
-                job.enabled = Boolean.TRUE.equals(frame.lampOn());
+                // The frame is the declaration: no lamp, so the job starts enabled and the command owns the switch.
+                job.enabled = true;
                 added++;
                 changed = true;
                 continue;
             }
-            if (frame.containerPos() != null && !frame.containerPos().equals(job.outputChest)) {
+            if (deposit == null && frame.containerPos() != null && !frame.containerPos().equals(job.outputChest)) {
                 job.outputChest = frame.containerPos();
                 changed = true;
             }
@@ -513,7 +512,22 @@ public class AutoEnchantModule extends Module {
                 importFrameSpec(job, frame);
                 changed = true;
             }
-            if (frame.lampOn() != null && frame.lampOn() != job.enabled) { job.enabled = frame.lampOn(); changed = true; }
+        }
+        // Presence is the switch: a template that is still on the platform is enabled, one that was taken down is
+        // disabled in place. Nothing is ever deleted, so re-hanging the template restores the old entry (targets,
+        // name and chests) without re-importing it. Only trusted when this scan actually saw frames - running `scan`
+        // from somewhere else must not switch the whole platform off.
+        if (platformVisible) {
+            java.util.Set<String> declared = frames.stream().map(JobFrame::item)
+                .collect(java.util.stream.Collectors.toSet());
+            for (AutoEnchantConfig.Enchant job : config.enchants.values()) {
+                if (job == null) continue;
+                boolean present = declared.contains(EnchantPresetCatalog.shortId(job.item == null ? "" : job.item));
+                if (job.enabled != present) {
+                    job.enabled = present;
+                    changed = true;
+                }
+            }
         }
         if (changed) {
             com.zenith.Globals.saveConfigAsync();
@@ -539,12 +553,14 @@ public class AutoEnchantModule extends Module {
 
     /**
      * Persists the container roles declared by their own frames: the redstone-dust frame binds every job's pickup
-     * chest, an anvil frame binds the anvil supply and a book frame binds that enchantment's book container.
+     * chest, the redstone-block frame binds every job's deposit chest, an anvil frame binds the anvil supply and a book
+     * frame binds that enchantment's book container.
      *
-     * <p>The unload chest is not bound here: it is the equipment frame's own container (the job's
-     * {@code outputChest}), which serves both finished and half-done pieces. A {@code overflowChestPos} from an older
-     * config is dropped by {@code AutoEnchantConfigSerializer} so a job cannot keep sending pieces to a chest that is
-     * no longer scanned.
+     * <p>Pickup and deposit are platform-wide on purpose: one blank chest feeds every job and one deposit chest
+     * receives finished, half-done and failed pieces alike, so they are written into each job's
+     * {@code inputItemChest}/{@code outputChest} and the state machine keeps resolving a single role. A
+     * {@code overflowChestPos} from an older config is dropped by {@code AutoEnchantConfigSerializer} so a job cannot
+     * keep sending pieces to a chest that is no longer scanned.
      */
     private boolean applyMarkerBindings(List<Marker> foundMarkers) {
         AutoEnchantConfig config = AutoEnchantPlugin.PLUGIN_CONFIG;
@@ -558,6 +574,14 @@ public class AutoEnchantModule extends Module {
                 for (AutoEnchantConfig.Enchant job : config.enchants.values()) {
                     if (job == null || pos.equals(job.inputItemChest)) continue;
                     job.inputItemChest = pos;
+                    changed = true;
+                }
+            } else if ("output".equals(role)) {
+                // The redstone-block frame declares the shared deposit chest: finished, half-done and failed pieces all
+                // leave through it, so it overrides any per-job chest set by hand or by an older platform.
+                for (AutoEnchantConfig.Enchant job : config.enchants.values()) {
+                    if (job == null || pos.equals(job.outputChest)) continue;
+                    job.outputChest = pos;
                     changed = true;
                 }
             } else if ("anvil_supply".equals(role)) {
@@ -620,8 +644,8 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
-     * Book and anvil-supply markers resolve to the first container found by walking straight down from the frame's own
-     * block, so a frame on a wall, a shelf, or two blocks above a chest all work without a fixed offset.
+     * Fallback for a marker whose frame is not mounted on its container: walk straight down from the frame's own block
+     * and take the first container, so a frame on a wall, a shelf, or two blocks above a chest still works.
      */
     private BlockPos supplyContainerPos(BlockPos frame) {
         int depth = Math.max(1, Math.min(SUPPLY_SCAN_DEPTH, 16));
@@ -633,20 +657,30 @@ public class AutoEnchantModule extends Module {
     }
 
     /**
-     * Every marker resolves to the first container below its frame: book chests, anvil supply, the pickup chest
-     * (redstone dust) and the unload chest (the equipment frame itself, used for finished and half-done pieces alike).
-     * One rule for all roles means a frame on a wall, a shelf, or several blocks above a container all work, and the
-     * layout never depends on the frame's facing. Only chests, barrels and shulker boxes are accepted as a target.
+     * Resolves the container a frame marks. A frame stuck onto a container marks that container directly - the block
+     * the frame hangs on is the first candidate, whatever the frame's facing - and only a frame mounted on a wall,
+     * pillar or shelf falls back to the downward column scan. This is the same rule for every role, so the layout does
+     * not depend on the frame's facing or on an exact vertical offset.
      */
-    private BlockPos resolveContainer(BlockPos frame) {
+    private BlockPos resolveContainer(BlockPos frame, Entity entity) {
+        BlockPos attached = attachedContainerPosition(frame, entity);
+        if (isUsableContainer(attached)) return attached;
         return supplyContainerPos(frame);
+    }
+
+    /** First marker of a role, in scan order; used for the platform-wide pickup/deposit chests. */
+    private BlockPos firstMarker(List<Marker> foundMarkers, String role) {
+        for (Marker marker : foundMarkers) {
+            if (role.equals(marker.role()) && marker.containerPos() != null) return marker.containerPos();
+        }
+        return null;
     }
 
     private boolean isUsableContainer(BlockPos pos) {
         return pos != null && World.isChunkLoadedBlockPos(pos.x(), pos.z()) && isContainerBlock(pos);
     }
 
-    /** True when a loaded chest, barrel or shulker box is at this position; used to warn about bad job coordinates. */
+    /** True when a loaded storage container is at this position; used to warn about bad marker coordinates. */
     public boolean isContainerAt(BlockPos pos) {
         return isUsableContainer(pos);
     }
@@ -661,6 +695,11 @@ public class AutoEnchantModule extends Module {
     /** Human-readable list of the depths a marker scanned, so a bad setup can be fixed without guessing. */
     private String candidateText(BlockPos frame) {
         return scanText(frame);
+    }
+
+    /** The block a frame is mounted on, for marker diagnostics ("attached chest at ..."). */
+    private String attachedText(BlockPos frame, Entity entity) {
+        return "attached " + blockNameAt(attachedContainerPosition(frame, entity));
     }
 
     /** Describes the downward scan result, including what was found at the first few depths. */
@@ -769,9 +808,10 @@ public class AutoEnchantModule extends Module {
      * another chest when its block is missing), then a station-level chest from config, then a unique marker binding.
      * {@code job} may be null for roles that are not job-specific, such as the anvil supply container.
      *
-     * <p>{@code output} and {@code overflow} are the same chest on purpose: the equipment frame's container is the one
-     * unload chest, and finished pieces, half-done pieces and failed items all go back there. "overflow" is kept as a
-     * role name so the states and command modes that mention it still resolve to something real.
+     * <p>{@code output} and {@code overflow} are the same chest on purpose: the shared deposit chest (redstone-block
+     * frame) is the one unload chest, and finished pieces, half-done pieces and failed items all go back there.
+     * "overflow" is kept as a role name so the states and command modes that mention it still resolve to something
+     * real.
      */
     public java.util.Optional<BlockPos> containerPosition(AutoEnchantConfig.Enchant job, String role) {
         if (job != null) {
@@ -838,7 +878,7 @@ public class AutoEnchantModule extends Module {
         return isContainerBlockName(World.getBlock(pos.x(), pos.y(), pos.z()).name());
     }
 
-    /** Storage accepted as a marker target: chests, barrels and every shulker box colour. */
+    /** Storage accepted as a marker target: chests, trapped chests, barrels and every shulker box colour. */
     private boolean isContainerBlockName(String name) {
         return name.equals("chest")
             || name.equals("trapped_chest")
@@ -873,6 +913,7 @@ public class AutoEnchantModule extends Module {
 
     private String markerRole(ItemStack itemStack) {
         if (itemStack.getId() == ItemRegistry.REDSTONE.id()) return "input";
+        if (itemStack.getId() == ItemRegistry.REDSTONE_BLOCK.id()) return "output";
         if (isAnvilItem(itemStack)) return "anvil_supply";
         if (itemStack.getId() == ItemRegistry.ENCHANTED_BOOK.id()) {
             var component = itemStack.getDataComponentsOrEmpty().get(DataComponentTypes.STORED_ENCHANTMENTS);
@@ -991,13 +1032,14 @@ public class AutoEnchantModule extends Module {
             String frameFacing = String.valueOf(entity.getObjectData());
             BlockPos frame = entity.blockPos();
             String backing;
-            BlockPos resolved = role == null ? null : resolveContainer(frame);
+            BlockPos attached = attachedContainerPosition(frame, entity);
+            BlockPos resolved = role == null ? null : resolveContainer(frame, entity);
             if (resolved != null) {
-                backing = blockNameAt(resolved);
+                backing = blockNameAt(resolved) + (resolved.equals(attached) ? " (attached)" : " (below)");
             } else if (role == null) {
-                backing = "unrecognized marker; attached " + blockNameAt(attachedContainerPosition(frame, entity));
+                backing = "unrecognized marker; " + attachedText(frame, entity);
             } else {
-                backing = "NO CONTAINER; tried " + candidateText(frame);
+                backing = "NO CONTAINER; " + attachedText(frame, entity) + "; tried " + candidateText(frame);
             }
             boolean recognized = resolved != null;
             if (recognized) eligibleCount++;
@@ -1966,6 +2008,42 @@ public class AutoEnchantModule extends Module {
     private final Map<BlockPos, Integer> missingContainerMisses = new HashMap<>();
     private static final long MISSING_CONTAINER_MIN_MS = 2_000L;
     private static final long MISSING_CONTAINER_MAX_MS = 30_000L;
+    /**
+     * Supply windows opened in a row that held no anvil. The container is there, so the missing-container check cannot
+     * see this: the branch used to re-open the same barrel on the next tick, which came to roughly 150 opens per
+     * minute. Measured on the live bot: an empty anvil supply ran like that for five hours (44k opens) with the batch
+     * clock running, and nothing in the log said why. After {@link #ANVIL_SUPPLY_EMPTY_ROUNDS} empty windows the branch
+     * is parked with the same doubling backoff a vanished container gets, so the cost is a warning instead of a spin.
+     */
+    private int anvilSupplyEmptyRounds;
+    private static final int ANVIL_SUPPLY_EMPTY_ROUNDS = 3;
+    /**
+     * Book types found out of stock, and the time until they are tried again. Keyed by {@code id|level}.
+     *
+     * <p>A required book with no copy in its chest used to park the workflow on that chest forever: the batch keeps
+     * its job latched, so a bag of swords waiting for one missing book blocks every other item type sitting in the
+     * shared pickup chest. When {@link AutoEnchantConfig#bookStockoutSeconds} runs out the piece in hand is unloaded as
+     * half-done; the rest of its batch then leaves at once instead of waiting the same timeout per piece, and a new
+     * batch does not stall on the same book again within this window.
+     */
+    private final Map<String, Long> bookStockoutUntil = new HashMap<>();
+    /**
+     * Jobs that just had a batch evacuated, and how many times in a row. A blocked job is not fetched from the pickup
+     * chest until its mark expires, which is what actually lets another item type run; the wait doubles on every
+     * repeat so a job whose book is permanently gone costs one small batch per hour instead of one batch per cycle.
+     * Cleared as soon as a book for that job is withdrawn again.
+     */
+    private final Map<String, Long> jobStockoutUntil = new HashMap<>();
+    private final Map<String, Integer> jobStockoutRounds = new HashMap<>();
+    /** Wall clock of the first "this chest holds no X" for the current piece, and which book that was about. */
+    private long bookStockoutSince;
+    private String bookStockoutKey;
+    /**
+     * Set while the piece is unloaded because its book ran out. The unload goes to the deposit chest whatever the job's
+     * {@code postEnchantStoreMode} says: sending the piece back to the pickup chest would hand it straight back to the
+     * same empty book chest on the next cycle, which is the loop this evacuation exists to break.
+     */
+    private boolean stockoutEvacuation;
     private static final int MAX_ITEM_ATTEMPTS = 3;
     private static final long SKIP_COOLDOWN_MS = 300_000L;
     /** When the current enchantItem was picked up, for the Discord completion log. */
@@ -2132,7 +2210,8 @@ public class AutoEnchantModule extends Module {
         List<AutoEnchantConfig.Enchant> runnable = runnableJobs();
         if (runnable.isEmpty()) {
             setWorkflowStatus(configProblems().isEmpty()
-                ? "No enabled job - light the lamp above a frame, or run 'autoEnchant add <id> <item> <inputChest> <outputChest>'"
+                ? "No enabled job - put an equipment frame on the platform (or 'autoEnchant set <item> on'), or run "
+                    + "'autoEnchant add <id> <item> <inputChest> <outputChest>'"
                 : "Waiting for a valid job configuration: " + configProblems().getFirst());
             return;
         }
@@ -2205,6 +2284,15 @@ public class AutoEnchantModule extends Module {
             }
         }
         stationPathFuture = PathingRequestFuture.rejected;
+        if (runnable.stream().allMatch(this::jobBlocked)) {
+            // Every job is set aside waiting for an enchantment book. Opening the pickup chest would only find pieces
+            // nobody may work on, so wait it out instead of clicking at it once a second.
+            setWorkflowStatus("Every enabled job is waiting for an enchantment book: "
+                + runnable.stream().map(j -> j.item).collect(java.util.stream.Collectors.joining(", ")));
+            awaitRestockUntil(System.currentTimeMillis() + 5_000L);
+            state = State.AWAIT_RESTOCK;
+            return;
+        }
         List<BlockPos> chests = inputChests(runnable);
         if (chests.isEmpty()) {
             setWorkflowStatus("Enabled jobs have no reachable input chest");
@@ -2483,6 +2571,9 @@ public class AutoEnchantModule extends Module {
             ItemStack stack = openContainer().getItemStack(slot);
             Optional<AutoEnchantConfig.Enchant> match = runnableJobFor(stack);
             if (match.isEmpty()) continue;
+            // A job set aside for a book stockout must not be refilled from the chest: its pieces would be funded by
+            // a merge plan that cannot finish, and they would end up in the deposit chest one batch after another.
+            if (jobBlocked(match.get())) continue;
             // Every piece of an enabled job is taken, whatever state it is in: blank, half enchanted, carrying
             // enchantments outside the template, or already finished. Skipping the finished ones made a chest holding
             // nothing but the operator's finished sword look empty, and the pickup probe then reopened the same
@@ -3363,6 +3454,8 @@ public class AutoEnchantModule extends Module {
         if (fetchEmpty.contains(book)) {
             var emptyChest = bookContainerPosition(book.id(), book.level());
             if (emptyChest.isPresent()) openingPosition = emptyChest.get();
+            if (bookOutOfStock(book, "Book chest at " + openingPosition
+                + " holds no " + book.id() + " " + book.level())) return;
             reenter(State.RESTOCK_ENCHANTED_BOOK_GO_TO_CHEST, "Book chest at " + openingPosition
                 + " holds no " + book.id() + " " + book.level());
             return;
@@ -3380,13 +3473,129 @@ public class AutoEnchantModule extends Module {
         var chest = bookContainerPosition(book.id(), book.level());
         if (chest.isEmpty()) {
             // A missing book marker is a supply problem, not a failed enchant: the piece keeps its progress in the bag
-            // and the branch is entered again on the next tick.
+            // and the branch is entered again on the next tick. A marker that stays missing for the whole stockout
+            // timeout is the same dead end as an empty chest, so it is evacuated the same way.
+            if (bookOutOfStock(book, "No book chest is bound for " + book.id() + " " + book.level())) return;
             retryBranch("No book chest is bound for " + book.id() + " " + book.level());
             return;
         }
         openingPosition = chest.get();
+        if (containerGone(openingPosition)) {
+            // The chest block itself is missing: beginOpen parks that with a backoff and drops the transaction, so the
+            // workflow never reaches the empty-chest branch above. Without this check a covered book chest (a piston
+            // door, a shulker taken away) would hold the batch for as long as it stays away - forty minutes on the live
+            // bot - however long the stockout timeout is.
+            if (bookOutOfStock(book, "The book chest at " + openingPosition + " is gone")) return;
+        }
         trace("book chest for {} {} is {}", book.id(), book.level(), openingPosition);
         state = State.RESTOCK_ENCHANTED_BOOK_GO_TO_CHEST;
+    }
+
+    /**
+     * True when this book has been missing long enough to give up on the piece in hand.
+     *
+     * <p>The timer starts the first time the book is found unavailable for the current piece and is not reset while the
+     * workflow keeps coming back to the same one, so a batch that simply has to wait out a hand restock is untouched.
+     * Meeting the timeout unloads the piece as half-done and remembers the book as out of stock, which is what lets the
+     * rest of its batch and any following batch move on without paying the same wait again.
+     */
+    private boolean bookOutOfStock(EnchantPresetCatalog.Enchant book, String what) {
+        long now = System.currentTimeMillis();
+        String key = book.id() + "|" + book.level();
+        if (bookMarkedOutOfStock(book)) {
+            evacuateForStockout(book, 0L, true);
+            return true;
+        }
+        if (!key.equals(bookStockoutKey)) {
+            bookStockoutKey = key;
+            bookStockoutSince = now;
+        }
+        long waited = now - bookStockoutSince;
+        if (waited < stockoutTimeoutMs()) {
+            setWorkflowStatus(what + " (" + (waited / 1000) + "s of " + (stockoutTimeoutMs() / 1000) + "s)");
+            return false;
+        }
+        bookStockoutUntil.put(key, now + stockoutTimeoutMs());
+        evacuateForStockout(book, waited, false);
+        return true;
+    }
+
+    /** True while this book is remembered as out of stock, so no window is spent opening its chest again. */
+    private boolean bookMarkedOutOfStock(EnchantPresetCatalog.Enchant book) {
+        Long until = bookStockoutUntil.get(book.id() + "|" + book.level());
+        return until != null && System.currentTimeMillis() < until;
+    }
+
+    private long stockoutTimeoutMs() {
+        return Math.max(30L, AutoEnchantPlugin.PLUGIN_CONFIG.bookStockoutSeconds) * 1000L;
+    }
+
+    /** {@code 5 min} / {@code 90s} for log lines, so a doubled wait still reads at a glance. */
+    private String waitText(long millis) {
+        if (millis >= 120_000L && millis % 60_000L == 0L) return (millis / 60_000L) + " min";
+        return Math.round(millis / 1000.0) + "s";
+    }
+
+    /** True while this job is set aside because its books ran out; the pickup chest is not emptied of its pieces. */
+    private boolean jobBlocked(AutoEnchantConfig.Enchant job) {
+        if (job == null || job.item == null) return false;
+        Long until = jobStockoutUntil.get(job.item);
+        if (until == null) return false;
+        if (System.currentTimeMillis() < until) return true;
+        jobStockoutUntil.remove(job.item);
+        return false;
+    }
+
+    /**
+     * Sets the job aside after a stockout evacuation and returns how long for. The wait doubles per repeat (5, 10, 20,
+     * 40 minutes, capped at an hour) so a job whose book is not coming back stops pulling its pieces out of the pickup
+     * chest and into the deposit chest every few minutes, while a book that was simply being restocked costs one wait.
+     */
+    private long blockJobForStockout(AutoEnchantConfig.Enchant job) {
+        if (job == null || job.item == null) return 0L;
+        long now = System.currentTimeMillis();
+        Long until = jobStockoutUntil.get(job.item);
+        // Already set aside by this same stockout: the remaining pieces of the batch must not escalate the wait, or a
+        // ten-piece batch would jump straight to the hourly cap on its way out.
+        if (until != null && now < until) return until - now;
+        int rounds = jobStockoutRounds.merge(job.item, 1, Integer::sum);
+        long backoff = Math.min(3_600_000L, stockoutTimeoutMs() * (1L << Math.min(4, rounds - 1)));
+        jobStockoutUntil.put(job.item, now + backoff);
+        return backoff;
+    }
+
+    /** A book arrived for this job: the stockout marks and the escalating wait are history. */
+    private void clearStockoutMarks(AutoEnchantConfig.Enchant job, EnchantPresetCatalog.Enchant book) {
+        if (book != null) bookStockoutUntil.remove(book.id() + "|" + book.level());
+        bookStockoutKey = null;
+        bookStockoutSince = 0L;
+        if (job == null || job.item == null) return;
+        jobStockoutUntil.remove(job.item);
+        jobStockoutRounds.remove(job.item);
+    }
+
+    /**
+     * Unloads the piece in hand as half-done so the platform can move on to the next job.
+     *
+     * <p>The piece is not failed: it keeps every merge it already paid for and leaves through the deposit chest like
+     * any other half-done piece, so feeding it back in later resumes it. The job itself is left alone - it stays
+     * enabled and simply has nothing to do until the book is stocked.
+     */
+    private void evacuateForStockout(EnchantPresetCatalog.Enchant book, long waitedMs, boolean alreadyMarked) {
+        stockoutEvacuation = true;
+        bookStockoutKey = null;
+        bookStockoutSince = 0L;
+        String waited = alreadyMarked || waitedMs < 1000L ? "still out of stock" : "out of stock for " + (waitedMs / 1000) + "s";
+        String job = target == null ? "the job" : target.displayName();
+        long blocked = blockJobForStockout(target);
+        trace("book {} {} {}; unloading the piece as half-done so the platform can take another job",
+            book.id(), book.level(), waited);
+        warn("Auto-enchant: book {} {} {} - the half-done {} goes to the deposit chest and the platform moves on to "
+            + "the next job (that job waits {} before taking another piece)", book.id(), book.level(), waited, job,
+            waitText(blocked));
+        failureReason = "book " + book.id() + " " + book.level() + " " + waited;
+        setWorkflowStatus("Book " + book.id() + " " + book.level() + " out of stock; unloading the half-done piece");
+        if (openContainerId() != 0) closeContainer(State.POST_ENCHANT); else state = State.POST_ENCHANT;
     }
 
     /**
@@ -3630,7 +3839,7 @@ public class AutoEnchantModule extends Module {
                 + "the rest waits for the next campaign", demand, budget, free, BOOK_FETCH_RESERVE);
         }
         for (var entry : want.entrySet()) {
-            if (fetchEmpty.contains(entry.getKey())) continue;
+            if (fetchEmpty.contains(entry.getKey()) || bookMarkedOutOfStock(entry.getKey())) continue;
             int take = entry.getValue();
             if (take > budget) {
                 // A whole type or nothing: half a type leaves part of the batch one step ahead of the rest, and the
@@ -3647,7 +3856,7 @@ public class AutoEnchantModule extends Module {
         // then advances a few pieces at a time - slower, but it always makes progress instead of parking.
         if (fetchQueue.isEmpty() && budget > 0) {
             for (var entry : want.entrySet()) {
-                if (fetchEmpty.contains(entry.getKey())) continue;
+                if (fetchEmpty.contains(entry.getKey()) || bookMarkedOutOfStock(entry.getKey())) continue;
                 int take = Math.min(entry.getValue(), budget);
                 budget -= take;
                 fetchQueue.add(new BookFetch(entry.getKey(), take));
@@ -3722,6 +3931,8 @@ public class AutoEnchantModule extends Module {
         if (carried > fetchBefore) {
             trace("book(s) taken: {} {} carried x{} (+{})", book.id(), book.level(), carried, carried - fetchBefore);
             fetchBefore = carried;
+            // The book is back: the job is no longer set aside and its next stockout starts the escalation over.
+            clearStockoutMarks(target, book);
             fetchIndex++;
             state = State.RESTOCK_ENCHANTED_BOOK_CLOSE;
             return;
@@ -4551,7 +4762,9 @@ public class AutoEnchantModule extends Module {
         // the job's output chest, because finished and half-done pieces share one container.
         State goTo;
         String role;
-        if (failureReason == null) {
+        if (failureReason == null || stockoutEvacuation) {
+            // A stockout evacuation is a half-done piece, not a failed one, but it still has to leave through the
+            // deposit chest: the pickup chest would hand it back to the same empty book chest on the next cycle.
             goTo = State.STORE_GO_TO_CHEST;
             role = "output";
         } else if (target.postEnchantStoreMode == AutoEnchantConfig.Enchant.PostEnchantStoreMode.TO_RESTOCK) {
@@ -5151,15 +5364,35 @@ public class AutoEnchantModule extends Module {
     }
 
     private void takeSupplyAnvils() {
-        if (countStacks(ItemRegistry.ANVIL) >= PLUGIN_CONFIG.anvilRestockStacks) { state = State.CLOSE_SUPPLY; return; }
-        int slot = findAnvilInTop();
-        if (slot < 0) {
-            // Empty supply container: close the window and walk back up to the open branch. No retry counter and no
-            // back-off - the same chest is entered again on the next tick.
-            reenter(State.RESTOCK_ANVIL_GO_TO_CHEST,
-                "Anvil supply at " + openingPosition + " holds no anvil");
+        if (countStacks(ItemRegistry.ANVIL) >= PLUGIN_CONFIG.anvilRestockStacks) {
+            anvilSupplyEmptyRounds = 0;
+            state = State.CLOSE_SUPPLY;
             return;
         }
+        int slot = findAnvilInTop();
+        if (slot < 0) {
+            // The container is there, it is simply out of anvils. Re-entering the open branch straight away turned this
+            // into a spin (~150 opens per minute, five hours on the live bot) that looked like work in the log. Park it
+            // instead after a few empty windows, and say so once per back-off step: restocking the barrel is the only
+            // way out, so waiting is the honest behaviour.
+            if (++anvilSupplyEmptyRounds < ANVIL_SUPPLY_EMPTY_ROUNDS) {
+                reenter(State.RESTOCK_ANVIL_GO_TO_CHEST,
+                    "Anvil supply at " + openingPosition + " holds no anvil");
+                return;
+            }
+            long now = System.currentTimeMillis();
+            long backoff = Math.min(MISSING_CONTAINER_MAX_MS, MISSING_CONTAINER_MIN_MS
+                * (1L << Math.min(4, anvilSupplyEmptyRounds - ANVIL_SUPPLY_EMPTY_ROUNDS)));
+            String what = "The anvil supply at " + openingPosition + " holds no anvil; checking again in "
+                + (backoff / 1000) + "s";
+            warn("Auto-enchant: {} - put anvils back there, the station at {} cannot be rebuilt without one", what,
+                anvilPosition);
+            setWorkflowStatus(what);
+            awaitRestockUntil(now + backoff);
+            if (openContainerId() != 0) closeContainer(State.AWAIT_RESTOCK); else state = State.AWAIT_RESTOCK;
+            return;
+        }
+        anvilSupplyEmptyRounds = 0;
         submit(new ShiftClick(openContainerId(), slot, ShiftClickItemAction.LEFT_CLICK), State.RESTOCK_ANVIL_AWAIT_WITHDRAW);
     }
 
@@ -5869,7 +6102,10 @@ public class AutoEnchantModule extends Module {
         String duration = MathHelper.formatDuration(Duration.ofMillis(
             Math.max(0L, System.currentTimeMillis() - transactionStartedAt)));
         int levels = Math.max(0, preEnchantExpCount - carriedLevel());
-        if (AutoEnchantPlugin.PLUGIN_CONFIG.logTradeStatusToDiscord) {
+        // A piece set aside because its book ran out is not a failed enchant: it keeps every merge it paid for and
+        // goes back in when the book is stocked. One "Enchant Failed" embed per piece would read as ten broken items,
+        // so the evacuation only reaches the console.
+        if (AutoEnchantPlugin.PLUGIN_CONFIG.logTradeStatusToDiscord && !stockoutEvacuation) {
             var result = Embed.builder()
                 .title(succeeded ? "Enchant Completed" : "Enchant Failed")
                 .addField("Enchant ID", target.displayName())
@@ -6138,6 +6374,7 @@ public class AutoEnchantModule extends Module {
         flushing = false;
         returningExcessInput = false;
         returningExcessBook = false;
+        stockoutEvacuation = false;
         returnSlots = List.of();
         batchUnload = false;
         depositSlots = List.of();

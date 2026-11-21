@@ -20,18 +20,19 @@ ZenithProxy 插件 `auto-enchant` 的完整设计与实现说明。本文是项�
 
 ## 2. 站点布置：展示框即声明
 
-布置方式决定作业从哪来。**一切都由展示框声明，不需要手工配坐标**（手工坐标仍然优先，见 §4）。所有展示框都遵守同一条容器解析规则：**从展示框所在方块垂直向下找第一个容器**（箱子、陷阱箱、木桶、潜影盒，最多 `SUPPLY_SCAN_DEPTH = 8` 格），与展示框朝向无关，因此挂墙、放架子、隔两格都能用。
+布置方式决定作业从哪来。**一切都由展示框声明，不需要手工配坐标**（手工坐标仍然优先，见 §4）。所有展示框都遵守同一条容器解析规则：**先看展示框贴附的方块**——框直接贴在一个容器上时就用这个容器；贴附的方块不是容器时，**再从展示框所在方块垂直向下找第一个容器**（箱子、陷阱箱、木桶、潜影盒，最多 `SUPPLY_SCAN_DEPTH = 8` 格）。因此框可以贴在箱子正面、挂在箱子上方、放架子上，都不依赖朝向。
 
 | 展示框里放的物品 | 角色 | 绑定到什么 |
 | --- | --- | --- |
-| 可耐久装备（剑、镐、盔甲…） | 作业模板 | 框下第一个容器 = 该作业的 `outputChest`（成品与半成品共用）；框里的附魔与名称导入作业目标 |
-| 附魔书（单条附魔） | 书箱 | 框下第一个容器 = `enchantBook[附魔id]` |
-| 铁砧 / 损坏的铁砧 / 开裂的铁砧 | 铁砧补给 | 框下第一个容器 = `anvilChest` |
-| 红石粉 | 共享取货箱 | 框下第一个容器 = **所有作业**的 `inputItemChest` |
-| 红石块 | 已废弃 | 旧版用来标记半成品箱；现在静默忽略，不报错 |
+| 可耐久装备（剑、镐、盔甲…） | 作业模板 | 框里的附魔与名称导入作业目标；框贴附/下方的容器只在该平台没有红石块标记时作为该作业 `outputChest` 的兜底 |
+| 附魔书（单条附魔） | 书箱 | 贴附/下方第一个容器 = `enchantBook[附魔id]` |
+| 铁砧 / 损坏的铁砧 / 开裂的铁砧 | 铁砧补给 | 贴附/下方第一个容器 = `anvilChest` |
+| 红石粉 | 共享白板取货箱 | 贴附/下方第一个容器 = **所有作业**的 `inputItemChest` |
+| 红石块 | 共享成品卸货箱 | 贴附/下方第一个容器 = **所有作业**的 `outputChest`（成品、半成品、失败件共用） |
 | 空框 | 装饰 | 忽略 |
 
-- **红石灯 = 作业开关**：从展示框向上最多 `LAMP_SCAN_HEIGHT` 格内第一个红石灯，亮 = `enabled=true`，灭 = `false`；没有灯时保留配置里的值。灯不必紧贴展示框，因此墙上的框也能用柱子顶端的灯控制。
+- **展示框本身就是作业声明和开关**：不再读红石灯。扫描到成品模板框就为该装备生成或更新一条 config（各自的附魔集合 + 自定义名）；模板框还在平台上 → `enabled=true`，模板框被拿走 → 只把该条 `enabled=false`，**绝不删除**，重新挂回模板即可原样恢复。`scan` 只新增和更新，不清理旧条目。
+- 一个平台只有一套共享取货/卸货箱：白板取货箱、成品卸货箱各一个，书箱按附魔种类各一个（12 种附魔 = 12 个容器），铁砧补给箱一个（铁砧框标记），另外扫描最近的铁砧和砂轮作为站点。
 - 同一物品出现两个模板框：报冲突，保留第一个，不抢容器。
 - 只有带 `max_damage` 的物品才算模板，装饰性展示框不会凭空生成作业。
 - 扫描只检查已加载区块；每次真正操作前复核方块、容器和库存，坐标失效不会静默换箱子（见 §13）。
@@ -69,8 +70,8 @@ ZenithProxy 插件 `auto-enchant` 的完整设计与实现说明。本文是项�
 | --- | --- |
 | `enabled` | 是否参与轮转 |
 | `item` | 目标物品 id（短 id） |
-| `inputItemChest` | 取货箱；红石粉框会覆盖它 |
-| `outputChest` | 卸货箱（成品 + 半成品）；装备模板框会覆盖它 |
+| `inputItemChest` | 取货箱；红石粉框（共享白板取货箱）会覆盖它 |
+| `outputChest` | 卸货箱（成品 + 半成品 + 失败件）；红石块框（共享成品卸货箱）会覆盖它 |
 | `renameName` | 改名目标，空串 = 不改名 |
 | `postEnchantStoreMode` | `NONE` 留在背包重试 / `TO_RESTOCK` 半成品回取货箱 / `TO_OVERFLOW` 半成品去卸货箱 |
 | `itemEnchantments` | 目标附魔集合 `附魔id -> 等级`；由模板导入，也可用 `outputEnchants` 编辑 |
@@ -186,6 +187,19 @@ ZenithProxy 插件 `auto-enchant` 的完整设计与实现说明。本文是项�
 
 一件做完先留在背包（仍占本批名额），直接从背包接手下一件。整批没有待附魔件时一次性 shift-click 把该作业的成品批量卸进 `outputChest`，随后释放批次闩锁、作业指针前进。背包快满时提前卸货兜底；背包被超额空剑堵死且没有成品可卸时，把超出的一批空剑退回取货箱（原料回原料箱，不丢东西）。失败件走 `postEnchantStoreMode`，不走批量路径。
 
+### 8.3.1 缺书时的半成品卸货
+
+一个必需的书箱里没有那本书时，流程会站在书箱前反复开窗等待——而批次闩锁还握在手里，于是**整个平台都停在一种书缺失上**：取货箱里刚放进去的镐子没人取，背包里的剑也出不去。
+
+所以缺书有一个上限，`bookStockoutSeconds`（默认 300s，`autoEnchant bookStockout <seconds>` 可调）：
+
+1. 从这件第一次发现书取不到开始计时（书箱空、或书箱方块被活塞门/搬走挡掉都算），期间正常等，不改行为。
+2. 超时后把这件当**半成品**卸到成品卸货箱（`outputChest`），附魔进度原样保留，喂回去就能接着做。它不算失败，不进冷却。
+3. 这本书在 `bookStockoutSeconds` 内记为缺货：同批剩下的件不再各等一轮，直接跟着卸出去；这段时间也不会再为它开书箱。
+4. 该**作业被让开**（`jobStockoutUntil`），取货箱不再取它这一类的件——这才是"去附魔下一个条目"真正生效的地方。等待时间每次翻倍（5→10→20→40 分钟，上限 1 小时），避免书长期不回时把取货箱里的同款件一批批倒进卸货箱。下次这本书真的取到时立即解除并重置翻倍。
+
+作业本身不关、不删，书补上后自动回到队列。日志是一条 WARN：`book X Y is out of stock for Ns - the half-done <item> goes to the deposit chest ...`。
+
 ### 8.4 状态机
 
 主链：
@@ -220,6 +234,8 @@ ENTRYPOINT → EVAL_RESTOCK → RESTOCK_INPUT_* → EVAL_UNCHANT/BATCH_GRIND
 
 使用前后复核铁砧方块状态（anvil / chipped / damaged 都可用，`damaged` 用完即消失）。发现消失：先看背包有没有铁砧，没有就从 `anvilChest` 取 `anvilRestockStacks` 组，走到 `anvil` 放置点，核验目标方块可替换，放置后重新确认方块类型。当前件重试三次仍不行就按半成品处理；没有可用铁砧时不取新件，按 `restartDelay` 退避扫描。
 
+铁砧补给箱是**空的**（箱子在、里面没有铁砧）要单独处理：它不算"容器消失"，所以 `reportMissingContainer` 看不见它。连续 `ANVIL_SUPPLY_EMPTY_ROUNDS`（=3）个窗口都没取到铁砧后就按 2s→4s→8s→16s→30s 退避停放，并打一条 `The anvil supply at … holds no anvil` 的 WARN。没有这个计数时该分支会在下一 tick 重新开同一个箱子，实测**每分钟约 150 次开箱、连续 5 小时（4.4 万次）**，批次计时照跑，日志里看起来像在干活。
+
 ## 11. 开窗可靠性（实测结论）
 
 开窗点击分两条路：路径可达性由 Pathfinder 负责，窗口是否出现由计时器判断。`openRetryTicks` 就是"点了没反应，多久重发"。
@@ -247,7 +263,9 @@ ENTRYPOINT → EVAL_RESTOCK → RESTOCK_INPUT_* → EVAL_UNCHANT/BATCH_GRIND
 ## 13. 失败处理
 
 - 单件失败（缺书、缺铁砧、诅咒、超费用、预览不符、结果不匹配）→ 记录原因，按 `postEnchantStoreMode` 卸货或留包重试，队列继续，不设全局暂停。
+- 缺书超过 `bookStockoutSeconds` → 不再算失败，按半成品卸到成品箱并把该作业让开一段时间（见 §8.3.1），平台继续做下一个条目。
 - 环境问题（区块未加载、断线、没有可用铁砧）→ 有上限的指数退避，周期性重扫；恢复后自动续跑。
+- 站点容器消失（展示框贴附或下方的箱子/潜影盒被搬走）→ 按 2s→4s→…→30s 停放并报出名字，箱子放回即续跑；空箱子（在但没货）走同一套退避。
 - 槽位被玩家/漏斗改动 → 快照不匹配就取消当前事务，不碰陌生物品。
 - 容器满 / 找不到输出箱 → 事务物品留在背包重试，失败三次后冷却 5 分钟再试；绝不丢弃玩家原有物品。
 - 窗口超时或状态不同步 → 有限次重读，仍无法确认则放弃本件，不盲目连点。
@@ -262,7 +280,7 @@ autoEnchant list                                      作业清单（开关、�
 autoEnchant add <id> <enchantItem> <取货坐标> <卸货坐标>   手工建作业
 autoEnchant del <id> / clear                          删除一个 / 全部
 autoEnchant set help                                  set 子命令一览
-autoEnchant set <id> on|off                           作业开关（红石灯会覆盖它）
+autoEnchant set <id> on|off                           作业开关（scan 会按模板框是否存在覆盖它）
 autoEnchant set <id> inputItem <item>                 目标物品
 autoEnchant set <id> inputItemChest <x> <y> <z>       取货箱
 autoEnchant set <id> outputChest <x> <y> <z>          卸货箱
@@ -278,6 +296,7 @@ autoEnchant anvilRestock <stacks>                     补铁砧时取几组
 autoEnchant ExpFarmSpot <x> <y> <z>                   刷经验站位
 autoEnchant scanRange <horizontal> <vertical>         扫描半径
 autoEnchant actionDelay / restartDelay / openRetry / waitForInteractTimeout <ticks>
+autoEnchant bookStockout <seconds>                     缺书多久后卸半成品并换下一个作业
 autoEnchant renameOnly on|off                         只改名模式
 autoEnchant logTradeStatusToDiscord on|off
 ```
@@ -307,8 +326,8 @@ autoEnchant logTradeStatusToDiscord on|off
 
 ## 16. 验收清单
 
-1. 扫描能把展示框解析成作业、书箱、铁砧补给、共享取货箱，冲突有报告。
-2. 模板的附魔与名称能导入作业；手改目标不会被周期扫描覆盖。
+1. 扫描能把展示框解析成作业、书箱、铁砧补给、共享白板取货箱、共享成品卸货箱，冲突有报告；贴附容器的框优先用贴附容器。
+2. 每个成品模板框生成/更新一条作业（附魔 + 自定义名）；框在 = 启用，框拿走 = 禁用但不删除；手改目标不会被周期扫描覆盖。
 3. 整批取货补齐到 `batchSize`，成品与冷却件都占名额。
 4. 祛魔整批一次判定、一个砂轮窗口连续磨完；白板件不进砂轮。
 5. STEP 下取书按 frontier，数量等于整批缺口，只留 1 个空位，不出现超 36 格。
