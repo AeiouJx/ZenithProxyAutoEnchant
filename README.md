@@ -64,4 +64,6 @@ The plugin jar lands in `build/libs/`. Deployment is not part of the repository:
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+GNU Affero General Public License v3.0 (AGPL-3.0), see [LICENSE](LICENSE).
+
+This plugin runs as part of a Minecraft proxy that users interact with over a network. Under AGPL-3.0, if you modify it and let others use the modified version over a network, you must offer them the corresponding source code.
